@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 18:52:29 +0900
+Subject: [PATCH] Fix build.gradle.kts: use supervertex-api dependency and
+ update version string
+
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index ef9ff422e177907c38be7f832cdc8ab82d39c585..ed89fd9b60b29b1e5f5fed03739a1cab747048bb 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -7,7 +7,7 @@ plugins {
+ }
+ 
+ dependencies {
+-    implementation(project(":plazma-api")) // Purpur
++    implementation(project(":supervertex-api")) // Purpur // SuperVertex
+     implementation("io.papermc.paper:paper-mojangapi:1.19.4-R0.1-SNAPSHOT") // Purpur
+     // Paper start
+     implementation("org.jline:jline-terminal-jansi:3.23.0") // Plazma - Bump Dependencies
+@@ -81,7 +81,7 @@ tasks.jar {
+         attributes(
+             "Main-Class" to "org.bukkit.craftbukkit.Main",
+             "Implementation-Title" to "CraftBukkit",
+-            "Implementation-Version" to "git-Plazma-$implementationVersion", // Pufferfish // Purpur // Plazma
++            "Implementation-Version" to "git-SuperVertex-$implementationVersion", // Pufferfish // Purpur // Plazma // SuperVertex
+             "Implementation-Vendor" to date, // Paper
+             "Specification-Title" to "Bukkit",
+             "Specification-Version" to project.version,

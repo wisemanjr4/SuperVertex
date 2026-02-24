@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 18:49:04 +0900
+Subject: [PATCH] Async entity tracker: parallelize sendChanges via
+ ForkJoinPool
+
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexThreadPool.java b/src/main/java/dev/supervertex/SuperVertexThreadPool.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..912d2fe7e7a0ccc4209bc0b954ed0621ea262183
+--- /dev/null
++++ b/src/main/java/dev/supervertex/SuperVertexThreadPool.java
+@@ -0,0 +1,48 @@
++package dev.supervertex;
++
++import java.util.concurrent.ForkJoinPool;
++import java.util.concurrent.ForkJoinWorkerThread;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * SuperVertex 用スレッドプール。
++ * エンティティトラッカーなど非同期処理に使用する専用スレッドプールを管理する。
++ */
++public final class SuperVertexThreadPool {
++
++    private SuperVertexThreadPool() {}
++
++    /**
++     * エンティティトラッカー用スレッドプール。
++     * {@link SuperVertexConfig#asyncThreadPoolSize} に基づいて初期化される。
++     */
++    public static volatile ForkJoinPool TRACKER_POOL = createPool("supervertex-tracker");
++
++    /**
++     * 設定に基づいてスレッドプールを再初期化する。
++     * サーバー起動時に SuperVertexConfig.init() 後に呼ぶこと。
++     */
++    public static void init() {
++        int size = SuperVertexConfig.asyncThreadPoolSize;
++        TRACKER_POOL = createPool("supervertex-tracker", size);
++    }
++
++    private static ForkJoinPool createPool(String namePrefix) {
++        return createPool(namePrefix, Math.max(2, Runtime.getRuntime().availableProcessors()));
++    }
++
++    private static ForkJoinPool createPool(String namePrefix, int parallelism) {
++        AtomicInteger counter = new AtomicInteger(0);
++        return new ForkJoinPool(
++            parallelism,
++            pool -> {
++                ForkJoinWorkerThread thread = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
++                thread.setName(namePrefix + "-" + counter.getAndIncrement());
++                thread.setDaemon(true);
++                return thread;
++            },
++            null,
++            false
++        );
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index c5a45f15cbb003c4e9c407edcd65cf38c8f43380..4a679feb1e53fbf9dee4f68099ca13a457af8859 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -226,6 +226,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+         // SuperVertex start
+         try {
+             dev.supervertex.SuperVertexConfig.init((java.io.File) options.valueOf("supervertex-settings"));
++            dev.supervertex.SuperVertexThreadPool.init();
+         } catch (Exception e) {
+             DedicatedServer.LOGGER.error("Unable to load SuperVertex configuration", e);
+             return false;
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index d41086166c39fedf8da29ac9010c501ef5fe3131..b17ae055c8a14e19264b7d8936b8f422af3343b8 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -1253,6 +1253,30 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+ 
+     // Paper start - optimised tracker
+     private final void processTrackQueue() {
++        // SuperVertex start - parallel entity tracker sendChanges
++        if (dev.supervertex.SuperVertexConfig.asyncEntityTracker) {
++            // Phase 1: updatePlayers on main thread (AsyncCatcher requirement)
++            for (TrackedEntity tracker : this.entityMap.values()) {
++                tracker.updatePlayers(tracker.entity.getPlayersInTrackRange());
++            }
++            // Phase 2: sendChanges in parallel via ForkJoinPool
++            // Each TrackedEntity only modifies its own per-entity state.
++            // Packet sends go through Netty which is thread-safe.
++            java.util.List<TrackedEntity> snapshot = new java.util.ArrayList<>(this.entityMap.values());
++            try {
++                dev.supervertex.SuperVertexThreadPool.TRACKER_POOL.submit(() ->
++                    snapshot.parallelStream().forEach(tracker -> tracker.serverEntity.sendChanges())
++                ).get();
++            } catch (Exception e) {
++                // フォールバック: メインスレッドで直接実行
++                for (TrackedEntity tracker : snapshot) {
++                    tracker.serverEntity.sendChanges();
++                }
++            }
++            return;
++        }
++        // SuperVertex end - parallel entity tracker sendChanges
++
+         //this.level.timings.tracker1.startTiming(); // Purpur
+         try {
+             for (TrackedEntity tracker : this.entityMap.values()) {

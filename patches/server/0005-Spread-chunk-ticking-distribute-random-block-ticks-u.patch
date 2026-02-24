@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 18:51:22 +0900
+Subject: [PATCH] Spread chunk ticking: distribute random block ticks using
+ hash-based scheduling
+
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index aa0e800456bdd9ba5dd6ee80ba48d2097413130b..d440b90305675432c89205de6aaba51450c23101 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -784,7 +784,17 @@ public class ServerChunkCache extends ChunkSource {
+                     }
+ 
+                     if (true || this.level.shouldTickBlocksAt(chunkcoordintpair.toLong())) { // Paper - the chunk is known ticking
+-                        this.level.tickChunk(chunk1, k);
++                        // SuperVertex start - spread chunk ticking across multiple ticks
++                        // chunkTickSpreadFactor == 1 の場合はバニラ動作（毎 tick 全チャンク）。
++                        // > 1 の場合はチャンク座標のハッシュを使ってサブセットを選択し負荷を分散させる。
++                        final int spreadFactor = dev.supervertex.SuperVertexConfig.chunkTickSpreadFactor;
++                        final boolean shouldTick = spreadFactor <= 1
++                            || (Math.abs(chunkcoordintpair.x * 1664525 + chunkcoordintpair.z * 1013904223) % spreadFactor)
++                                == (worlddata.getGameTime() % spreadFactor);
++                        if (shouldTick) {
++                            this.level.tickChunk(chunk1, k);
++                        }
++                        // SuperVertex end - spread chunk ticking
+                         if ((chunksTicked++ & 1) == 0) net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks(); // Paper
+                     }
+                 }

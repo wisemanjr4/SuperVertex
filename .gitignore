@@ -40,3 +40,7 @@ desktop.ini
 
 # Paperweight
 .gradle-cache/
+
+# Generated source directories (applyPatches で自動生成)
+SuperVertex-API/
+SuperVertex-Server/

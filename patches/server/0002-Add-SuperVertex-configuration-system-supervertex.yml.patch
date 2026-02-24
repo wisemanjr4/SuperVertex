@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 18:45:38 +0900
+Subject: [PATCH] Add SuperVertex configuration system (supervertex.yml)
+
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..021503b74e78b7ac84f9a91b82f857c47a154e96
+--- /dev/null
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -0,0 +1,153 @@
++package dev.supervertex;
++
++import com.google.common.base.Throwables;
++import org.bukkit.Bukkit;
++import org.bukkit.configuration.InvalidConfigurationException;
++import org.bukkit.configuration.file.YamlConfiguration;
++
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.util.logging.Level;
++
++@SuppressWarnings("unused")
++public class SuperVertexConfig {
++
++    private static final String HEADER = """
++            SuperVertex Configuration
++            高性能Minecraftサーバーソフトウェア SuperVertex の設定ファイルです。
++            低クロックCPUでの大人数サーバー向けに最適化されています。
++            """;
++
++    private static File CONFIG_FILE;
++    public static YamlConfiguration config;
++    public static int version;
++
++    public static void init(File configFile) {
++        CONFIG_FILE = configFile;
++        config = new YamlConfiguration();
++        try {
++            config.load(CONFIG_FILE);
++        } catch (IOException ignore) {
++        } catch (InvalidConfigurationException ex) {
++            Bukkit.getLogger().log(Level.SEVERE, "Could not load supervertex.yml, please correct your syntax errors", ex);
++            throw Throwables.propagate(ex);
++        }
++        config.options().header(HEADER);
++        config.options().copyDefaults(true);
++
++        version = getInt("config-version", 1);
++        set("config-version", version);
++
++        readConfig(SuperVertexConfig.class, null);
++    }
++
++    static void readConfig(Class<?> clazz, Object instance) {
++        for (Method method : clazz.getDeclaredMethods()) {
++            if (Modifier.isPrivate(method.getModifiers())) {
++                if (method.getParameterTypes().length == 0 && method.getReturnType() == Void.TYPE) {
++                    try {
++                        method.setAccessible(true);
++                        method.invoke(instance);
++                    } catch (InvocationTargetException ex) {
++                        throw Throwables.propagate(ex.getCause());
++                    } catch (Exception ex) {
++                        Bukkit.getLogger().log(Level.SEVERE, "Error invoking " + method, ex);
++                    }
++                }
++            }
++        }
++
++        try {
++            config.save(CONFIG_FILE);
++        } catch (IOException ex) {
++            Bukkit.getLogger().log(Level.SEVERE, "Could not save " + CONFIG_FILE, ex);
++        }
++    }
++
++    private static void set(String path, Object val) {
++        config.addDefault(path, val);
++        config.set(path, val);
++    }
++
++    private static boolean getBoolean(String path, boolean def) {
++        config.addDefault(path, def);
++        return config.getBoolean(path, config.getBoolean(path));
++    }
++
++    private static int getInt(String path, int def) {
++        config.addDefault(path, def);
++        return config.getInt(path, config.getInt(path));
++    }
++
++    private static double getDouble(String path, double def) {
++        config.addDefault(path, def);
++        return config.getDouble(path, config.getDouble(path));
++    }
++
++    // =========================================================
++    // Performance: Thread Pool
++    // =========================================================
++
++    /**
++     * SuperVertex 非同期タスク用スレッドプールのスレッド数。
++     * 0 = 利用可能プロセッサ数を自動検出。
++     * 低クロックCPUでは多めに設定することを推奨。
++     */
++    public static int asyncThreadPoolSize = 0;
++
++    private static void asyncThreadPoolSize() {
++        asyncThreadPoolSize = getInt("performance.async-thread-pool-size", asyncThreadPoolSize);
++        if (asyncThreadPoolSize <= 0) {
++            asyncThreadPoolSize = Math.max(2, Runtime.getRuntime().availableProcessors());
++        }
++    }
++
++    // =========================================================
++    // Performance: Entity Tracker
++    // =========================================================
++
++    /**
++     * エンティティ追跡更新を非同期スレッドで行うかどうか。
++     * 多プレイヤー環境でメインスレッドの負荷を大幅に削減する。
++     */
++    public static boolean asyncEntityTracker = true;
++
++    private static void asyncEntityTracker() {
++        asyncEntityTracker = getBoolean("performance.async-entity-tracker", asyncEntityTracker);
++    }
++
++    // =========================================================
++    // Performance: Mob Spawning
++    // =========================================================
++
++    /**
++     * モブスポーン処理を何 tick に分散させるか。
++     * 例: 3 の場合、3 tick に 1 回スポーン処理（デフォルト 1 = 毎 tick）。
++     * 値を大きくするとスポーン遅延が増えるが、メインスレッド負荷が減る。
++     */
++    public static int mobSpawnThrottleTicks = 1;
++
++    private static void mobSpawnThrottleTicks() {
++        mobSpawnThrottleTicks = getInt("performance.mob-spawn-throttle-ticks", mobSpawnThrottleTicks);
++        if (mobSpawnThrottleTicks < 1) mobSpawnThrottleTicks = 1;
++    }
++
++    // =========================================================
++    // Performance: Chunk Ticking
++    // =========================================================
++
++    /**
++     * ランダムチャンク tick を分散させる係数。
++     * 例: 2 の場合、全チャンクの代わりに毎 tick 半分のチャンクを処理し 2 tick で一周。
++     * 1 = 無効（バニラ動作）。
++     */
++    public static int chunkTickSpreadFactor = 1;
++
++    private static void chunkTickSpreadFactor() {
++        chunkTickSpreadFactor = getInt("performance.chunk-tick-spread-factor", chunkTickSpreadFactor);
++        if (chunkTickSpreadFactor < 1) chunkTickSpreadFactor = 1;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index 778b79ce3530781705f6d6ae11a2631f186e3763..c5a45f15cbb003c4e9c407edcd65cf38c8f43380 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -223,6 +223,14 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+         }
+         org.purpurmc.purpur.PurpurConfig.registerCommands();
+         // Purpur end
++        // SuperVertex start
++        try {
++            dev.supervertex.SuperVertexConfig.init((java.io.File) options.valueOf("supervertex-settings"));
++        } catch (Exception e) {
++            DedicatedServer.LOGGER.error("Unable to load SuperVertex configuration", e);
++            return false;
++        }
++        // SuperVertex end
+         com.destroystokyo.paper.VersionHistoryManager.INSTANCE.getClass(); // load version history now
+         io.papermc.paper.brigadier.PaperBrigadierProviderImpl.INSTANCE.getClass(); // init PaperBrigadierProvider
+         // Paper end
+diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
+index 4970b246356bbd04eb1f9715da3fc7c9494573e2..9f4f7bcab7579eb4a6569b65cec87899577d42a0 100644
+--- a/src/main/java/org/bukkit/craftbukkit/Main.java
++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
+@@ -194,6 +194,13 @@ public class Main {
+                         .defaultsTo(new File("pufferfish.yml"))
+                         .describedAs("Yml file");
+                 // Purpur end
++                // SuperVertex start
++                acceptsAll(asList("supervertex", "supervertex-settings"), "File for SuperVertex settings")
++                        .withRequiredArg()
++                        .ofType(File.class)
++                        .defaultsTo(new File("supervertex.yml"))
++                        .describedAs("Yml file");
++                // SuperVertex end
+ 
+                 // Paper start
+                 acceptsAll(asList("server-name"), "Name of the server")

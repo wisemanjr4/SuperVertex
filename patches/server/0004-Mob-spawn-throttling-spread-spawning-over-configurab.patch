@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 18:50:36 +0900
+Subject: [PATCH] Mob spawn throttling: spread spawning over configurable tick
+ intervals
+
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 0ae45cf5a084fd412305e8b2f5dabe608b4eb1c1..aa0e800456bdd9ba5dd6ee80ba48d2097413130b 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -743,6 +743,13 @@ public class ServerChunkCache extends ChunkSource {
+ 
+             //gameprofilerfiller.popPush("spawnAndTick"); // Purpur
+             boolean flag2 = this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && !this.level.players().isEmpty(); // CraftBukkit
++            // SuperVertex start - mob spawn throttling
++            // mobSpawnThrottleTicks > 1 のとき、ゲーム時間が指定 tick の倍数の時のみスポーンを実行する。
++            // これによりメインスレッドのスポーン処理負荷を分散させる。
++            if (flag2 && dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks > 1) {
++                flag2 = (worlddata.getGameTime() % dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks) == 0;
++            }
++            // SuperVertex end - mob spawn throttling
+ 
+             // Paper - only shuffle if per-player mob spawning is disabled
+             // Paper - moved natural spawn event up
