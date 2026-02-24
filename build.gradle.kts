@@ -64,8 +64,8 @@ paperweight {
         ref.set(providers.gradleProperty("plazmaCommit"))
 
         withStandardPatcher {
-            apiSourceDirName.set("Plazma-API")
-            serverSourceDirName.set("Plazma-Server")
+            apiSourceDirPath.set("Plazma-API")
+            serverSourceDirPath.set("Plazma-Server")
 
             apiPatchDir.set(layout.projectDirectory.dir("patches/api"))
             apiOutputDir.set(layout.projectDirectory.dir("SuperVertex-API"))
