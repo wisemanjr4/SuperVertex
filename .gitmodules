@@ -1,0 +1,4 @@
+[submodule "PlazmaBukkit"]
+	path = PlazmaBukkit
+	url = https://github.com/PlazmaMC/PlazmaBukkit.git
+	branch = old/1.19.4

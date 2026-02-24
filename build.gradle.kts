@@ -1,32 +1,77 @@
+import io.papermc.paperweight.util.*
+import io.papermc.paperweight.util.constants.PAPERCLIP_CONFIG
+
 plugins {
     java
     `maven-publish`
-    id("io.papermc.paperweight.patcher") version "2.0.0-beta.14"
+    id("com.github.johnrengelman.shadow") version "8.1.1" apply false
+    id("io.papermc.paperweight.patcher") version "1.5.10"
 }
-
-group = "dev.supervertex"
-version = "1.21.4-R0.1-SNAPSHOT"
-description = "SuperVertex - High performance Minecraft server software based on PlazmaMC"
 
 repositories {
     mavenCentral()
-    maven("https://repo.papermc.io/repository/maven-public/")
-    maven("https://oss.sonatype.org/content/repositories/snapshots/")
+    maven("https://repo.papermc.io/repository/maven-public/") {
+        content {
+            onlyForConfigurations(PAPERCLIP_CONFIG)
+        }
+    }
 }
 
 dependencies {
-    remapper("net.fabricmc:tiny-remapper:0.10.3:fat")
-    decompiler("org.vineflower:vineflower:1.10.1")
+    remapper("net.fabricmc:tiny-remapper:0.8.11:fat")
+    decompiler("net.minecraftforge:forgeflower:2.0.627.2")
     paperclip("io.papermc:paperclip:3.0.3")
 }
 
+allprojects {
+    apply(plugin = "java")
+    apply(plugin = "maven-publish")
+
+    java.toolchain.languageVersion.set(JavaLanguageVersion.of(17))
+}
+
+subprojects {
+    tasks {
+        withType<JavaCompile>().configureEach {
+            options.encoding = Charsets.UTF_8.name()
+            options.release.set(17)
+        }
+        withType<Javadoc> {
+            options.encoding = Charsets.UTF_8.name()
+        }
+        withType<ProcessResources> {
+            filteringCharset = Charsets.UTF_8.name()
+        }
+    }
+
+    repositories {
+        mavenCentral()
+        maven("https://repo.papermc.io/repository/maven-public/")
+        maven("https://oss.sonatype.org/content/groups/public/")
+        maven("https://libraries.minecraft.net/")
+        maven("https://jitpack.io")
+    }
+}
+
 paperweight {
-    upstreamData.set(providers.provider {
-        io.papermc.paperweight.patcher.upstream.PatchTaskConfig.UpstreamData(
-            upstream = "plazma",
-            upstreamBranch = "main",
-            serverProject = "super-vertex-server",
-            apiProject = "super-vertex-api"
-        )
-    })
+    serverProject.set(project(":supervertex-server"))
+
+    remapRepo.set("https://maven.fabricmc.net/")
+    decompileRepo.set("https://files.minecraftforge.net/maven/")
+
+    useStandardUpstream("plazma") {
+        url.set(github("PlazmaMC", "PlazmaBukkit"))
+        ref.set(providers.gradleProperty("plazmaCommit"))
+
+        withStandardPatcher {
+            apiSourceDirName.set("Plazma-API")
+            serverSourceDirName.set("Plazma-Server")
+
+            apiPatchDir.set(layout.projectDirectory.dir("patches/api"))
+            apiOutputDir.set(layout.projectDirectory.dir("SuperVertex-API"))
+
+            serverPatchDir.set(layout.projectDirectory.dir("patches/server"))
+            serverOutputDir.set(layout.projectDirectory.dir("SuperVertex-Server"))
+        }
+    }
 }
