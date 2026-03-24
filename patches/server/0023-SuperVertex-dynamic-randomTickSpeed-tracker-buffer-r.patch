@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 23:18:10 +0900
+Subject: [PATCH] SuperVertex: dynamic randomTickSpeed, tracker buffer reuse,
+ spawn throttle fix
+
+- dynamic-random-tick-speed: far chunks get reduced randomTickSpeed
+  (configurable near-chunks radius + min-factor, default off)
+- Entity tracker: reuse ArrayList buffer to eliminate per-tick GC allocation
+- Mob spawn: gate spawnForChunk with willSpawnThisTick so mob-spawn-throttle-ticks
+  also skips per-chunk spawn candidate iteration, not just createState
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 3eb09f1801a6ece14a6d1039454fa3e0f0e8737f..7fab8222d83784f42939309f1c059e35c5c9b423 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -254,6 +254,48 @@ public class SuperVertexConfig {
+         permissionCache = getBoolean("performance.permission-cache", permissionCache);
+     }
+ 
++    // =========================================================
++    // Performance: Dynamic Random Tick Speed
++    // =========================================================
++
++    /**
++     * プレイヤーから遠いチャンクの randomTickSpeed を動的に削減するかどうか。
++     * プレイヤーから {@code dynamicRandomTickSpeedNearChunks} チャンク以内は
++     * 通常の randomTickSpeed、それ以遠は {@code dynamicRandomTickSpeedMinFactor} 倍に削減する。
++     * 広い viewDistance 環境でのメインスレッド負荷を大幅に削減できる。
++     * 遠方のブロック成長・草の広がり等は遅くなるため注意。
++     */
++    public static boolean dynamicRandomTickSpeed = false;
++
++    private static void dynamicRandomTickSpeed() {
++        dynamicRandomTickSpeed = getBoolean("performance.dynamic-random-tick-speed", dynamicRandomTickSpeed);
++    }
++
++    /**
++     * dynamic-random-tick-speed が true の場合、プレイヤーからこのチャンク半径以内は
++     * 通常の randomTickSpeed を維持する。それ以遠は min-factor 倍まで削減される。
++     * デフォルト: 5 (プレイヤー周囲 5 チャンク以内はフルスピード)
++     */
++    public static int dynamicRandomTickSpeedNearChunks = 5;
++
++    private static void dynamicRandomTickSpeedNearChunks() {
++        dynamicRandomTickSpeedNearChunks = getInt("performance.dynamic-random-tick-speed-near-chunks", dynamicRandomTickSpeedNearChunks);
++        if (dynamicRandomTickSpeedNearChunks < 0) dynamicRandomTickSpeedNearChunks = 0;
++    }
++
++    /**
++     * dynamic-random-tick-speed が true の場合、遠方チャンクに適用する randomTickSpeed の最小係数。
++     * 例: 0.25 = 通常速度の 25%。0.0 = ランダムtick完全停止。
++     * デフォルト: 0.25
++     */
++    public static double dynamicRandomTickSpeedMinFactor = 0.25;
++
++    private static void dynamicRandomTickSpeedMinFactor() {
++        dynamicRandomTickSpeedMinFactor = getDouble("performance.dynamic-random-tick-speed-min-factor", dynamicRandomTickSpeedMinFactor);
++        if (dynamicRandomTickSpeedMinFactor < 0.0) dynamicRandomTickSpeedMinFactor = 0.0;
++        if (dynamicRandomTickSpeedMinFactor > 1.0) dynamicRandomTickSpeedMinFactor = 1.0;
++    }
++
+     // =========================================================
+     // 設定の再読み込み
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index b17ae055c8a14e19264b7d8936b8f422af3343b8..ea0e88934d04b9819bcdf422a76738b8b3bb6148 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -151,6 +151,8 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+     private final String storageName;
+     private final PlayerMap playerMap;
+     public final Int2ObjectMap<ChunkMap.TrackedEntity> entityMap;
++    // SuperVertex - async tracker: reusable snapshot buffer to avoid per-tick ArrayList allocation
++    private final java.util.ArrayList<TrackedEntity> trackerSnapshotBuffer = new java.util.ArrayList<>(256);
+     private final Long2ByteMap chunkTypeCache;
+     private final Long2LongMap chunkSaveCooldowns;
+     private final Queue<Runnable> unloadQueue;
+@@ -1262,7 +1264,10 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+             // Phase 2: sendChanges in parallel via ForkJoinPool
+             // Each TrackedEntity only modifies its own per-entity state.
+             // Packet sends go through Netty which is thread-safe.
+-            java.util.List<TrackedEntity> snapshot = new java.util.ArrayList<>(this.entityMap.values());
++            // SuperVertex - reuse trackerSnapshotBuffer to avoid per-tick ArrayList allocation
++            trackerSnapshotBuffer.clear();
++            trackerSnapshotBuffer.addAll(this.entityMap.values());
++            java.util.List<TrackedEntity> snapshot = trackerSnapshotBuffer;
+             try {
+                 dev.supervertex.SuperVertexThreadPool.TRACKER_POOL.submit(() ->
+                     snapshot.parallelStream().forEach(tracker -> tracker.serverEntity.sendChanges())
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 59c8958caebd46992f65b03c3fff787cf453ee8f..d9c680f9aaad9e57958c4bce20295da883ca9dab 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -79,6 +79,10 @@ public class ServerChunkCache extends ChunkSource {
+     
+     // SuperVertex - RCT: reuse buffer across ticks to avoid per-tick ArrayList allocation
+     private final java.util.ArrayList<LevelChunk> rctChunksBuffer = new java.util.ArrayList<>(256);
++    // SuperVertex - dynamic randomTickSpeed: flat [chunkX, chunkZ, chunkX, chunkZ, ...] player position snapshot
++    // Written by main thread before chunk loop; read-only during RCT workers (safe via ForkJoinPool happens-before).
++    private int[] playerChunkXZCache = new int[0];
++    private int playerChunkXZCacheSize = 0; // number of valid entries (pairs)
+ 
+     public boolean firstRunSpawnCounts = true; // Pufferfish
+     public final java.util.concurrent.atomic.AtomicBoolean _pufferfish_spawnCountsReady = new java.util.concurrent.atomic.AtomicBoolean(false); // Pufferfish - optimize countmobs
+@@ -724,6 +728,20 @@ public class ServerChunkCache extends ChunkSource {
+                 && (dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks <= 1
+                     || (worlddata.getGameTime() % dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks) == 0);
+             // SuperVertex end - pre-compute spawn flag
++            // SuperVertex start - dynamic randomTickSpeed: snapshot player chunk positions once per tick
++            // Workers read this array later (safe: written before ForkJoinPool.execute, happens-before).
++            if (dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeed) {
++                java.util.List<net.minecraft.server.level.ServerPlayer> players = this.level.players;
++                int needed = players.size() * 2;
++                if (playerChunkXZCache.length < needed) playerChunkXZCache = new int[needed + 8];
++                playerChunkXZCacheSize = players.size();
++                for (int _i = 0; _i < players.size(); _i++) {
++                    net.minecraft.server.level.ServerPlayer _p = players.get(_i);
++                    playerChunkXZCache[_i * 2]     = net.minecraft.core.SectionPos.blockToSectionCoord((int) _p.getX());
++                    playerChunkXZCache[_i * 2 + 1] = net.minecraft.core.SectionPos.blockToSectionCoord((int) _p.getZ());
++                }
++            }
++            // SuperVertex end - dynamic randomTickSpeed snapshot
+             // Paper start - per player mob spawning
+             NaturalSpawner.SpawnState spawnercreature_d; // moved down
+             if ((this.spawnFriendlies || this.spawnEnemies) && this.chunkMap.playerMobDistanceMap != null) { // don't count mobs when animals and monsters are disabled
+@@ -813,9 +831,13 @@ public class ServerChunkCache extends ChunkSource {
+ 
+                 if ((true || this.level.isNaturalSpawningAllowed(chunkcoordintpair)) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, false)) { // Paper - optimise anyPlayerCloseEnoughForSpawning // Paper - the chunk is known ticking
+                     chunk1.incrementInhabitedTime(j);
+-                    if (flag2 && (!gg.pufferfish.pufferfish.PufferfishConfig.enableAsyncMobSpawning || _pufferfish_spawnCountsReady.get()) && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, true)) { // Spigot // Paper - optimise anyPlayerCloseEnoughForSpawning & optimise chunk tick iteration
++                    // SuperVertex start - mob spawn throttle: skip spawnForChunk on non-spawn ticks
++                    // willSpawnThisTick already gates createState; also gate spawnForChunk to avoid
++                    // iterating spawn candidates on ticks where lastSpawnState was not refreshed.
++                    if (willSpawnThisTick && flag2 && (!gg.pufferfish.pufferfish.PufferfishConfig.enableAsyncMobSpawning || _pufferfish_spawnCountsReady.get()) && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, true)) { // Spigot // Paper - optimise anyPlayerCloseEnoughForSpawning & optimise chunk tick iteration
+                         NaturalSpawner.spawnForChunk(this.level, chunk1, lastSpawnState, this.spawnFriendlies, this.spawnEnemies, flag1); // Pufferfish
+                     }
++                    // SuperVertex end
+ 
+                     if (true || this.level.shouldTickBlocksAt(chunkcoordintpair.toLong())) { // Paper - the chunk is known ticking
+                         // SuperVertex start - spread chunk ticking across multiple ticks
+@@ -834,7 +856,8 @@ public class ServerChunkCache extends ChunkSource {
+                                 rctChunksToTick.add(chunk1);
+                             } else {
+                                 // RCT 無効時: 従来通り逐次実行
+-                                this.level.tickChunk(chunk1, k);
++                                // SuperVertex - dynamic randomTickSpeed: adjust k per chunk distance
++                                this.level.tickChunk(chunk1, computeAdjustedRandomTickSpeed(chunkcoordintpair.x, chunkcoordintpair.z, k));
+                             }
+                         }
+                         // SuperVertex end - spread chunk ticking
+@@ -858,7 +881,10 @@ public class ServerChunkCache extends ChunkSource {
+                 java.util.List<java.util.List<LevelChunk>> regions =
+                     dev.supervertex.RegionizedChunkTicker.buildRegions(rctChunksToTick);
+                 dev.supervertex.RegionizedChunkTicker.tickRegionsParallel(regions,
+-                    chunk -> this.level.tickChunkRandomOnly(chunk, randomTickSpeed));
++                    chunk -> this.level.tickChunkRandomOnly(
++                        chunk,
++                        // SuperVertex - dynamic randomTickSpeed: per-chunk adjusted k (reads playerChunkXZCache snapshot)
++                        computeAdjustedRandomTickSpeed(chunk.getPos().x, chunk.getPos().z, randomTickSpeed)));
+                 net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks();
+             }
+             // SuperVertex end - RCT Phase 2
+@@ -1074,6 +1100,23 @@ public class ServerChunkCache extends ChunkSource {
+         return this.lastSpawnState;
+     }
+ 
++    // SuperVertex start - dynamic randomTickSpeed: compute distance-adjusted k for a chunk
++    // Called from both RCT workers (thread-safe: reads immutable playerChunkXZCache snapshot) and main thread.
++    private int computeAdjustedRandomTickSpeed(int chunkX, int chunkZ, int baseK) {
++        if (!dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeed || baseK <= 0) return baseK;
++        final int nearChunks = dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeedNearChunks;
++        final int n = playerChunkXZCacheSize;
++        for (int i = 0; i < n; i++) {
++            int dx = Math.abs(playerChunkXZCache[i * 2]     - chunkX);
++            int dz = Math.abs(playerChunkXZCache[i * 2 + 1] - chunkZ);
++            if (Math.max(dx, dz) <= nearChunks) return baseK; // within near radius → full speed
++        }
++        // Far from all players — reduce to min factor
++        int reduced = (int) (baseK * dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeedMinFactor + 0.5);
++        return Math.max(0, reduced);
++    }
++    // SuperVertex end - dynamic randomTickSpeed
++
+     public void removeTicketsOnClosing() {
+         this.distanceManager.removeTicketsOnClosing();
+     }
