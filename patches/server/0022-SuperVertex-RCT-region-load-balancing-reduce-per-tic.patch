@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 16:01:41 +0900
+Subject: [PATCH] SuperVertex: RCT region load balancing + reduce per-tick
+ allocations
+
+- ServerChunkCache: reuse ArrayList buffer (rctChunksBuffer) across ticks
+  instead of allocating new ArrayList<>() every tick. Eliminates one
+  GC allocation per tick when RCT is enabled.
+- RegionizedChunkTicker.buildRegions: merge regions smaller than
+  rct-min-region-size (default: 4 chunks) into the main-thread region.
+  Avoids ForkJoinPool worker wake-up overhead for tiny isolated regions
+  where parallelism cost > benefit.
+- buildRegions: sort worker regions by size descending so largest region
+  goes to main thread (index 0), giving predictable load distribution.
+- SuperVertexConfig: add rct-min-region-size option (default: 4).
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index 5cdc647dab51853cbf323251b8098c4b22fcab49..9cd775c02108270699ae50a73ae081bf564cc6ef 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -129,9 +129,43 @@ public final class RegionizedChunkTicker {
+             return Collections.singletonList(chunks);
+         }
+ 
+-        List<List<LevelChunk>> result = new ArrayList<>(reuseRegionMap.values());
+-        reuseRegionMap.clear(); // Map から List への参照を切る
+-        return result;
++        // 小リージョンをメインスレッド region (index 0) にマージし、
++        // ForkJoinPool 起動コスト > 並列化利益 になるケースを排除する。
++        // 残ったリージョンはサイズ降順で並べ負荷を均等化する。
++        final int minSize = SuperVertexConfig.rctMinRegionSize;
++        List<LevelChunk> mainRegion = null; // メインスレッド用（小リージョン集積）
++        List<List<LevelChunk>> workerRegions = new ArrayList<>(reuseRegionMap.size());
++        for (List<LevelChunk> region : reuseRegionMap.values()) {
++            if (region.size() < minSize) {
++                if (mainRegion == null) mainRegion = new ArrayList<>(region);
++                else mainRegion.addAll(region);
++            } else {
++                workerRegions.add(region);
++            }
++        }
++        reuseRegionMap.clear();
++
++        // ワーカーリージョンをサイズ降順にソート（最大リージョンが index 0 = メインスレッド）
++        workerRegions.sort((a, b) -> b.size() - a.size());
++
++        if (workerRegions.isEmpty()) {
++            // すべて小リージョンだった → 逐次実行
++            return Collections.singletonList(mainRegion != null ? mainRegion : chunks);
++        }
++
++        // index 0: メインスレッド用（最大リージョン + 小リージョン残余）
++        if (mainRegion != null && !mainRegion.isEmpty()) {
++            // 最大リージョン (workerRegions[0]) に小リージョン分をマージしてメインスレッドへ
++            mainRegion.addAll(workerRegions.remove(0));
++            workerRegions.add(0, mainRegion);
++        }
++        // workerRegions[0] がメインスレッド、[1..] がワーカー
++
++        if (workerRegions.size() == 1) {
++            // ワーカーゼロ → 逐次実行
++            return workerRegions;
++        }
++        return workerRegions;
+     }
+ 
+     // =========================================================
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 1e9a22a699a08a1e0acf6cef9caf4f1b208ecca5..3eb09f1801a6ece14a6d1039454fa3e0f0e8737f 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -222,6 +222,20 @@ public class SuperVertexConfig {
+         rctSerialThreshold = getInt("performance.rct-serial-threshold", rctSerialThreshold);
+     }
+ 
++    /**
++     * RCT ワーカースレッドに割り当てる最小リージョンサイズ（チャンク数）。
++     * この値未満のリージョンはメインスレッドで実行する。
++     * ForkJoinPool のタスク起動コスト（スレッドウェイクアップ等）が
++     * 小リージョンの並列化利益を上回るのを防ぐ。
++     * デフォルト: 4 (4チャンク未満はメインスレッドへ)
++     */
++    public static int rctMinRegionSize = 4;
++
++    private static void rctMinRegionSize() {
++        rctMinRegionSize = getInt("performance.rct-min-region-size", rctMinRegionSize);
++        if (rctMinRegionSize < 1) rctMinRegionSize = 1;
++    }
++
+     // =========================================================
+     // Performance: Per-tick Permission Cache
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 64f541a9c2d6f9073bd7d1d22922b3e6a441b35a..59c8958caebd46992f65b03c3fff787cf453ee8f 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -77,6 +77,9 @@ public class ServerChunkCache extends ChunkSource {
+ 
+     private final LevelChunk[] lastLoadedChunks = new LevelChunk[4 * 4];
+     
++    // SuperVertex - RCT: reuse buffer across ticks to avoid per-tick ArrayList allocation
++    private final java.util.ArrayList<LevelChunk> rctChunksBuffer = new java.util.ArrayList<>(256);
++
+     public boolean firstRunSpawnCounts = true; // Pufferfish
+     public final java.util.concurrent.atomic.AtomicBoolean _pufferfish_spawnCountsReady = new java.util.concurrent.atomic.AtomicBoolean(false); // Pufferfish - optimize countmobs
+ 
+@@ -790,9 +793,14 @@ public class ServerChunkCache extends ChunkSource {
+             }
+             // SuperVertex end - skip empty world chunk tick
+             // SuperVertex start - RCT: Phase 1 でスポーン/inhabitedTime を逐次処理しつつ tick 対象を収集する
+-            final java.util.List<LevelChunk> rctChunksToTick =
+-                dev.supervertex.SuperVertexConfig.regionizedChunkTicking
+-                    ? new java.util.ArrayList<>() : null;
++            // rctChunksBuffer を再利用することで毎 tick の ArrayList アロケーションを回避する
++            final java.util.List<LevelChunk> rctChunksToTick;
++            if (dev.supervertex.SuperVertexConfig.regionizedChunkTicking) {
++                rctChunksBuffer.clear();
++                rctChunksToTick = rctChunksBuffer;
++            } else {
++                rctChunksToTick = null;
++            }
+             // SuperVertex end - RCT Phase 1
+             try {
+             while (iterator1.hasNext()) {
