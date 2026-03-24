@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 15:50:53 +0900
+Subject: [PATCH] SuperVertex: RCT - add missing unsafe blocks, optimize hot
+ path
+
+Unsafe block denylist additions (prevent crashes/deadlocks):
+- LiquidBlock: LavaFluid.randomTick -> getBlockState -> join -> deadlock
+- MagmaBlock, BuddingAmethystBlock, MushroomBlock: cross-chunk read
+- NetherPortalBlock: entity spawn (Bukkit event)
+- IceBlock, NyliumBlock: callBlockFadeEvent (Bukkit)
+- FarmBlock: isNearWater cross-chunk scan
+- ChangeOverTimeBlock (copper): +/-4 Manhattan scan + handleBlockFormEvent
+- PointedDripstoneBlock: multi-level scan + handleBlockFormEvent
+- SaplingBlock: StructureGrowEvent (Bukkit)
+
+Performance optimizations:
+- isBlockSafeForRCT: replace 22 instanceof checks with boolean[]
+  array lookup indexed by block registry ID (O(1) after init).
+  initBlockSafetyCache() called at server startup.
+- buildRegions: reuse static int[]/Long2IntOpenHashMap/Int2ObjectOpenHashMap
+  buffers instead of allocating new ones every tick -> reduces GC.
+- Early return in buildRegions when Union-Find yields single region,
+  avoiding unnecessary list construction overhead.
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index ff39742380441563a132cc835b0b27c1e4a18fbe..5cdc647dab51853cbf323251b8098c4b22fcab49 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -64,9 +64,18 @@ public final class RegionizedChunkTicker {
+     }
+ 
+     // =========================================================
+-    // リージョン構築
++    // リージョン構築 — 再利用可能バッファでアロケーションを削減
+     // =========================================================
+ 
++    // buildRegions はメインスレッドのみ呼ぶため、スレッドセーフ不要
++    private static int[]   reuseParent   = new int[256];
++    private static int[]   reuseRank     = new int[256];
++    private static final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap reusePosIdx =
++            new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(512, 0.5f);
++    // regionMap の各 List は返却後に参照を保持するため毎回新規生成するが Map 本体は再利用
++    private static final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<List<LevelChunk>> reuseRegionMap =
++            new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
++
+     /**
+      * 与えられたチャンクリストを「隣接チャンクを同一グループ」にまとめる Union-Find でリージョンに分割する。
+      * 返却リストの各要素が 1 リージョンのチャンク一覧。
+@@ -80,40 +89,49 @@ public final class RegionizedChunkTicker {
+             return Collections.singletonList(chunks);
+         }
+ 
+-        // チャンク位置 → インデックスの高速マップ (fastutil Long2Int)
+-        it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap posToIndex =
+-                new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(size * 2, 0.5f);
+-        posToIndex.defaultReturnValue(-1);
++        // チャンク位置 → インデックスの高速マップ（再利用バッファ）
++        reusePosIdx.clear();
++        reusePosIdx.defaultReturnValue(-1);
++        if (reusePosIdx.size() < size * 2) reusePosIdx.ensureCapacity(size * 2);
+         for (int i = 0; i < size; i++) {
+-            posToIndex.put(chunks.get(i).getPos().toLong(), i);
++            reusePosIdx.put(chunks.get(i).getPos().toLong(), i);
+         }
+ 
+-        // Union-Find 初期化
+-        int[] parent = new int[size];
+-        int[] rank   = new int[size];
+-        for (int i = 0; i < size; i++) parent[i] = i;
++        // Union-Find 初期化（配列を再利用・必要なら拡張）
++        if (reuseParent.length < size) {
++            reuseParent = new int[size + 64];
++            reuseRank   = new int[size + 64];
++        }
++        int[] parent = reuseParent;
++        int[] rank   = reuseRank;
++        for (int i = 0; i < size; i++) { parent[i] = i; rank[i] = 0; }
+ 
+         // 4 方向隣接チャンクを結合
+-        final int[] DX = {1, -1, 0, 0};
+-        final int[] DZ = {0, 0, 1, -1};
+         for (int i = 0; i < size; i++) {
+             ChunkPos pos = chunks.get(i).getPos();
+-            for (int d = 0; d < 4; d++) {
+-                int neighborIdx = posToIndex.get(ChunkPos.asLong(pos.x + DX[d], pos.z + DZ[d]));
+-                if (neighborIdx >= 0) {
+-                    union(parent, rank, i, neighborIdx);
+-                }
+-            }
++            int cx = pos.x, cz = pos.z;
++            int n;
++            if ((n = reusePosIdx.get(ChunkPos.asLong(cx + 1, cz    ))) >= 0) union(parent, rank, i, n);
++            if ((n = reusePosIdx.get(ChunkPos.asLong(cx - 1, cz    ))) >= 0) union(parent, rank, i, n);
++            if ((n = reusePosIdx.get(ChunkPos.asLong(cx,     cz + 1))) >= 0) union(parent, rank, i, n);
++            if ((n = reusePosIdx.get(ChunkPos.asLong(cx,     cz - 1))) >= 0) union(parent, rank, i, n);
+         }
+ 
+-        // ルートでグループ化
+-        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<List<LevelChunk>> regionMap =
+-                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
++        // ルートでグループ化（Map 本体を再利用、各 List は新規）
++        reuseRegionMap.clear();
+         for (int i = 0; i < size; i++) {
+-            regionMap.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(chunks.get(i));
++            reuseRegionMap.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(chunks.get(i));
+         }
+ 
+-        return new ArrayList<>(regionMap.values());
++        // リージョンが 1 つ → 並列化不要（早期リターン）
++        if (reuseRegionMap.size() == 1) {
++            reuseRegionMap.clear();
++            return Collections.singletonList(chunks);
++        }
++
++        List<List<LevelChunk>> result = new ArrayList<>(reuseRegionMap.values());
++        reuseRegionMap.clear(); // Map から List への参照を切る
++        return result;
+     }
+ 
+     // =========================================================
+@@ -136,21 +154,76 @@ public final class RegionizedChunkTicker {
+     public static final java.util.concurrent.ConcurrentLinkedQueue<java.util.ArrayDeque<Runnable>> ALL_DEFERRED =
+             new java.util.concurrent.ConcurrentLinkedQueue<>();
+ 
++    // =========================================================
++    // ブロック安全性キャッシュ — 22回 instanceof → 1回配列アクセスに最適化
++    // =========================================================
++
++    /**
++     * ブロックレジストリ ID をインデックスとする安全性フラグ配列。
++     * true = RCT ワーカーで安全に randomTick 可能。
++     * サーバー起動時（ブロックレジストリ確定後）に {@link #initBlockSafetyCache()} で初期化される。
++     */
++    private static volatile boolean[] blockSafetyCache = null;
++
++    /**
++     * ブロックレジストリが確定した後に呼び出してキャッシュを初期化する。
++     * MinecraftServer 起動シーケンスの適切なタイミングで一度だけ呼ぶこと。
++     */
++    public static void initBlockSafetyCache() {
++        net.minecraft.core.Registry<net.minecraft.world.level.block.Block> reg =
++                net.minecraft.core.registries.BuiltInRegistries.BLOCK;
++        boolean[] cache = new boolean[reg.size()];
++        for (int i = 0; i < cache.length; i++) {
++            net.minecraft.world.level.block.Block b = reg.byId(i);
++            cache[i] = b != null && computeIsBlockSafe(b);
++        }
++        blockSafetyCache = cache;
++        org.apache.logging.log4j.LogManager.getLogger("SuperVertex/RCT")
++                .info("Block safety cache initialized: {} blocks ({} unsafe)",
++                        cache.length,
++                        (int) java.util.stream.IntStream.range(0, cache.length).filter(i -> !cache[i]).count());
++    }
++
+     /**
+      * ブロックが RCT ワーカースレッドから安全に randomTick できるかを返す。
+      *
+-     * 以下のブロックは randomTick 内で CraftEventFactory（Bukkit イベント）を呼ぶため
+-     * メインスレッドへの Deferred 実行が必要:
++     * キャッシュ初期化後はレジストリ ID での配列アクセス（O(1)) になる。
++     * キャッシュ未初期化時（起動直後）は instanceof チェックにフォールバック。
++     *
++     * @return true = 並列実行安全、false = メインスレッドへ Defer が必要
++     */
++    public static boolean isBlockSafeForRCT(net.minecraft.world.level.block.Block block) {
++        boolean[] cache = blockSafetyCache;
++        if (cache != null) {
++            int id = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getId(block);
++            if (id >= 0 && id < cache.length) return cache[id];
++        }
++        return computeIsBlockSafe(block);
++    }
++
++    /**
++     * instanceof チェックによる安全性判定（キャッシュ構築・フォールバック用）。
++     *
++     * 危険なブロック一覧（randomTick 内で Bukkit イベントまたはクロスチャンク read を行う）:
+      *   VineBlock, TurtleEggBlock, SweetBerryBushBlock, StemBlock (MelonStem/PumpkinStem),
+      *   SugarCaneBlock, SpreadingSnowyDirtBlock (Grass/Mycelium), SnowLayerBlock,
+      *   LeavesBlock, CropBlock (Wheat/Carrot/Potato 等), CocoaBlock, ChorusFlowerBlock,
+      *   CactusBlock, BambooStalkBlock, BambooSaplingBlock, RedStoneOreBlock,
+      *   GrowingPlantHeadBlock (Kelp/TwistingVines/WeepingVines 等), NetherWartBlock,
+-     *   BaseFireBlock (FireBlock)
+-     *
+-     * @return true = 並列実行安全、false = メインスレッドへ Defer が必要
++     *   BaseFireBlock (FireBlock),
++     *   LiquidBlock (Water/Lava) — LavaFluid.randomTick が隣接チャンクの getBlockState → deadlock
++     *   MagmaBlock — getFluidState(隣接) → getChunk → CompletableFuture.join → deadlock
++     *   BuddingAmethystBlock — 隣接6方向 getBlockState (クロスチャンク) + Bukkit event
++     *   MushroomBlock — ±4範囲 getBlockState (クロスチャンク) + Bukkit event
++     *   NetherPortalBlock — エンティティスポーン (Bukkit event)
++     *   IceBlock — CraftEventFactory.callBlockFadeEvent (Bukkit event)
++     *   FarmBlock — ±4範囲 isNearWater (クロスチャンク) + Bukkit event
++     *   NyliumBlock — CraftEventFactory.callBlockFadeEvent (Bukkit event)
++     *   ChangeOverTimeBlock (銅ブロック酸化系) — ±4 Manhattan getBlockState + handleBlockFormEvent (Bukkit)
++     *   PointedDripstoneBlock — 縦方向多段スキャン getBlockState + handleBlockFormEvent (Bukkit)
++     *   SaplingBlock — StructureGrowEvent (Bukkit event)
+      */
+-    public static boolean isBlockSafeForRCT(net.minecraft.world.level.block.Block block) {
++    private static boolean computeIsBlockSafe(net.minecraft.world.level.block.Block block) {
+         return !(block instanceof net.minecraft.world.level.block.VineBlock
+               || block instanceof net.minecraft.world.level.block.TurtleEggBlock
+               || block instanceof net.minecraft.world.level.block.SweetBerryBushBlock
+@@ -168,7 +241,18 @@ public final class RegionizedChunkTicker {
+               || block instanceof net.minecraft.world.level.block.RedStoneOreBlock
+               || block instanceof net.minecraft.world.level.block.GrowingPlantHeadBlock
+               || block instanceof net.minecraft.world.level.block.NetherWartBlock
+-              || block instanceof net.minecraft.world.level.block.BaseFireBlock);
++              || block instanceof net.minecraft.world.level.block.BaseFireBlock
++              || block instanceof net.minecraft.world.level.block.LiquidBlock    // 水・溶岩: 隣接チャンクread→deadlock
++              || block instanceof net.minecraft.world.level.block.MagmaBlock     // マグマ: getFluidState→getChunk→join→deadlock
++              || block instanceof net.minecraft.world.level.block.BuddingAmethystBlock // 隣接6方向getBlockState(クロスチャンク) + Bukkit
++              || block instanceof net.minecraft.world.level.block.MushroomBlock  // ±4範囲getBlockState(クロスチャンク) + Bukkit
++              || block instanceof net.minecraft.world.level.block.NetherPortalBlock // エンティティスポーン(Bukkit)
++              || block instanceof net.minecraft.world.level.block.IceBlock       // callBlockFadeEvent(Bukkit)
++              || block instanceof net.minecraft.world.level.block.FarmBlock      // ±4範囲isNearWater(クロスチャンク) + Bukkit
++              || block instanceof net.minecraft.world.level.block.NyliumBlock    // callBlockFadeEvent(Bukkit)
++              || block instanceof net.minecraft.world.level.block.ChangeOverTimeBlock // 銅酸化: ±4 Manhattan getBlockState + handleBlockFormEvent
++              || block instanceof net.minecraft.world.level.block.PointedDripstoneBlock // 多段スキャン + handleBlockFormEvent(Bukkit)
++              || block instanceof net.minecraft.world.level.block.SaplingBlock); // StructureGrowEvent(Bukkit)
+     }
+ 
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index 4a679feb1e53fbf9dee4f68099ca13a457af8859..984c0844cff16f41529901fe74c74cd7aab260cd 100644
+--- a/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -227,6 +227,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+         try {
+             dev.supervertex.SuperVertexConfig.init((java.io.File) options.valueOf("supervertex-settings"));
+             dev.supervertex.SuperVertexThreadPool.init();
++            dev.supervertex.RegionizedChunkTicker.initBlockSafetyCache(); // RCT block safety cache
+         } catch (Exception e) {
+             DedicatedServer.LOGGER.error("Unable to load SuperVertex configuration", e);
+             return false;

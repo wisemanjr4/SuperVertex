@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 15:50:34 +0900
+Subject: [PATCH] SuperVertex: Fix ConcurrentModificationException in dirty
+ attributes
+
+AttributeMap.dirtyAttributes was a plain HashSet. Async plugin threads
+modifying player attributes while the main thread iterated the set in
+ServerEntity.sendDirtyEntityData caused CME and server crash.
+
+Fix: use ConcurrentHashMap.newKeySet() which allows concurrent add/
+remove/iterate without throwing CME. Also removes Plazma's now-
+redundant synchronizedSet workaround.
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerEntity.java b/src/main/java/net/minecraft/server/level/ServerEntity.java
+index d6079c9577d65eab51dab8803eab6e46dccc8dd3..6f43c83b14cc8b0a81dd5a351497bc9827a029dc 100644
+--- a/src/main/java/net/minecraft/server/level/ServerEntity.java
++++ b/src/main/java/net/minecraft/server/level/ServerEntity.java
+@@ -419,8 +419,10 @@ public class ServerEntity {
+         }
+ 
+         if (this.entity instanceof LivingEntity) {
+-            Set<AttributeInstance> attributes = ((LivingEntity) this.entity).getAttributes().getDirtyAttributes(); // Plazma - suppress error from dirty attributes
+-            final Set<AttributeInstance> set = this.entity.level.plazmaLevelConfiguration().misc.suppressErrorFromDirtyAttributes ? java.util.Collections.synchronizedSet(attributes) : attributes; // Plazma - suppress error from dirty attributes
++            // SuperVertex start - CMEfix: dirtyAttributes is now ConcurrentHashMap.newKeySet(); Plazma synchronizedSet workaround removed
++            Set<AttributeInstance> attributes = ((LivingEntity) this.entity).getAttributes().getDirtyAttributes();
++            final Set<AttributeInstance> set = attributes;
++            // SuperVertex end
+             if (!set.isEmpty()) {
+                 // CraftBukkit start - Send scaled max health
+                 if (this.entity instanceof ServerPlayer) {
+diff --git a/src/main/java/net/minecraft/world/entity/ai/attributes/AttributeMap.java b/src/main/java/net/minecraft/world/entity/ai/attributes/AttributeMap.java
+index 210a0bee1227e4671909dd553ab22027cfc868fb..9af29151f2c68b9e2c7fe616a9e11f5b3c07d9ff 100644
+--- a/src/main/java/net/minecraft/world/entity/ai/attributes/AttributeMap.java
++++ b/src/main/java/net/minecraft/world/entity/ai/attributes/AttributeMap.java
+@@ -21,7 +21,10 @@ import org.slf4j.Logger;
+ public class AttributeMap {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final Map<Attribute, AttributeInstance> attributes = Maps.newHashMap();
+-    private final Set<AttributeInstance> dirtyAttributes = Sets.newHashSet();
++    // SuperVertex start - CMEfix: ConcurrentHashMap.newKeySet() prevents ConcurrentModificationException
++    // when async plugin threads add to dirtyAttributes while main thread iterates it in sendDirtyEntityData.
++    private final Set<AttributeInstance> dirtyAttributes = java.util.concurrent.ConcurrentHashMap.newKeySet();
++    // SuperVertex end
+     private final AttributeSupplier supplier;
+     private final java.util.function.Function<Attribute, AttributeInstance> createInstance; // Pufferfish
+     private final net.minecraft.world.entity.LivingEntity entity; // Purpur

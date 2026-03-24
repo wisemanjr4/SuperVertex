@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Fri, 20 Mar 2026 22:16:25 +0900
+Subject: [PATCH] SuperVertex: Fix permission cache
+ ConcurrentModificationException
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HashMap → ConcurrentHashMap に変更し volatile tick フィールドを追加。
+
+Paper Async Command Builder Thread Pool や VillagerMarket の PlayerJoinEvent
+ハンドラ等の非メインスレッドから hasPermission() が呼ばれると
+HashMap.computeIfAbsent がメインスレッドと競合し
+ConcurrentModificationException が発生していた。
+
+ConcurrentHashMap.computeIfAbsent はスレッドセーフなため競合が発生しない。
+volatile int sv_permCacheTick で tick 読み書きの可視性を保証する。
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+index 30631ea9c0d300473546525588572e366ab58edd..37cf3182ba0bd8f4018e982d5f31a097ee787821 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+@@ -77,8 +77,10 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+     // SuperVertex start - per-tick permission cache
+     // 1tickに同一ノードが何度もチェックされる場合に PermissibleBase/LuckPerms の
+     // ルックアップを省略する。recalculatePermissions() で即座に無効化される。
+-    private final java.util.HashMap<String, Boolean> sv_permCache = new java.util.HashMap<>();
+-    private int sv_permCacheTick = -1;
++    // ConcurrentHashMap を使用: Paper Async Command Builder 等の非メインスレッドから
++    // hasPermission() が呼ばれても ConcurrentModificationException が発生しない。
++    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> sv_permCache = new java.util.concurrent.ConcurrentHashMap<>();
++    private volatile int sv_permCacheTick = -1;
+     // SuperVertex end - per-tick permission cache
+ 
+     public CraftHumanEntity(final CraftServer server, final Player entity) {

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 15:50:40 +0900
+Subject: [PATCH] SuperVertex: Fix NPE in broadcastChanges for non-full chunks
+ (RCT)
+
+sectionLightChanged() uses getAvailableChunkNow() which returns proto-
+chunks, adding their ChunkHolder to needsChangeBroadcasting. When RCT
+light propagation reaches a loading neighbour chunk, tickChunks calls
+broadcastChanges(getFullChunkNowUnchecked()) with null -> NPE crash.
+
+Fix: null-check getFullChunkNowUnchecked() and skip non-full chunks.
+No players are tracking proto-chunks so broadcasts can be discarded.
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 1ca61785f683d4175cc351ed90d8abb85c3a668f..64f541a9c2d6f9073bd7d1d22922b3e6a441b35a 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -869,7 +869,13 @@ public class ServerChunkCache extends ChunkSource {
+                 ReferenceOpenHashSet<ChunkHolder> copy = this.chunkMap.needsChangeBroadcasting.clone();
+                 this.chunkMap.needsChangeBroadcasting.clear();
+                 for (ChunkHolder holder : copy) {
+-                    holder.broadcastChanges(holder.getFullChunkNowUnchecked()); // LevelChunks are NEVER unloaded
++                    // SuperVertex start - RCT null guard: sectionLightChanged uses getAvailableChunkNow() (returns proto-chunks),
++                    // but getFullChunkNowUnchecked() returns null for non-full chunks. RCT light propagation to
++                    // adjacent loading chunks causes NPE. Skip and discard — no players tracking non-full chunks yet.
++                    LevelChunk fullChunk = holder.getFullChunkNowUnchecked();
++                    if (fullChunk == null) continue;
++                    // SuperVertex end
++                    holder.broadcastChanges(fullChunk); // LevelChunks are NEVER unloaded
+                     if (holder.needsBroadcastChanges()) {
+                         // I DON'T want to KNOW what DUMB plugins might be doing.
+                         this.chunkMap.needsChangeBroadcasting.add(holder);

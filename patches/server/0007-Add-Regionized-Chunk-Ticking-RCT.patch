@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Feb 2026 20:23:15 +0900
+Subject: [PATCH] Add Regionized Chunk Ticking (RCT)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- RegionizedChunkTicker: Union-Find でチャンクを隣接グループに分割し
+  ForkJoinPool で並列 tickChunk を実行する
+- ServerLevel: tickChunk 内でスレッドローカルな MutableBlockPos / RandomSource
+  を使用する (RCT ワーカースレッド用)
+- ServerChunkCache: Phase1 (逐次: スポーン/inhabitedTime) と
+  Phase2 (並列: tickChunk) に分離
+- SuperVertexConfig: performance.regionized-chunk-ticking 設定を追加
+
+安全性: 隣接チャンクは必ず同一リージョンに属するため
+リージョン間に最低 1 チャンクの隙間が保証される。
+DivineMC/CanvasMC の実装を参考。
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ad1a91afbf2aececa06722e6c2dbef58b1cdffb
+--- /dev/null
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -0,0 +1,156 @@
++package dev.supervertex;
++
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.chunk.LevelChunk;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.function.Consumer;
++
++/**
++ * Regionized Chunk Ticking (RCT) for SuperVertex.
++ *
++ * プレイヤー周辺のチャンクを隣接グループ（リージョン）に分割し、
++ * 各リージョンを並列 tick することでマルチコア CPU を活用する。
++ *
++ * 安全性保証:
++ *   Union-Find で隣接チャンクは必ず同一リージョンに収まるため、
++ *   異なるリージョン間には最低 1 チャンクの隙間が存在する。
++ *   これにより並列 tickChunk の境界データ競合を回避する。
++ *
++ * 実装参考: DivineMC (CanvasMC fork)
++ */
++public final class RegionizedChunkTicker {
++
++    private RegionizedChunkTicker() {}
++
++    /**
++     * RCT ワーカースレッドであることを示すスレッドローカルフラグ。
++     * ServerLevel.tickChunk() 内でスレッドローカルリソースを使うかどうかの判定に用いる。
++     */
++    public static final ThreadLocal<Boolean> IN_RCT_CONTEXT = ThreadLocal.withInitial(() -> false);
++
++    /** RCT ワーカー用スレッドローカル MutableBlockPos */
++    public static final ThreadLocal<net.minecraft.core.BlockPos.MutableBlockPos> RCT_BLOCK_POS =
++            ThreadLocal.withInitial(net.minecraft.core.BlockPos.MutableBlockPos::new);
++
++    /** RCT ワーカー用スレッドローカル RandomSource */
++    public static final ThreadLocal<net.minecraft.util.RandomSource> RCT_RANDOM =
++            ThreadLocal.withInitial(() -> new io.papermc.paper.util.math.ThreadUnsafeRandom(
++                    java.util.concurrent.ThreadLocalRandom.current().nextLong()));
++
++    // =========================================================
++    // Union-Find 実装
++    // =========================================================
++
++    private static int find(int[] parent, int x) {
++        // パス半減による高速化
++        while (parent[x] != x) {
++            parent[x] = parent[parent[x]];
++            x = parent[x];
++        }
++        return x;
++    }
++
++    private static void union(int[] parent, int[] rank, int a, int b) {
++        int ra = find(parent, a);
++        int rb = find(parent, b);
++        if (ra == rb) return;
++        // ランクによる結合
++        if (rank[ra] < rank[rb]) { int t = ra; ra = rb; rb = t; }
++        parent[rb] = ra;
++        if (rank[ra] == rank[rb]) rank[ra]++;
++    }
++
++    // =========================================================
++    // リージョン構築
++    // =========================================================
++
++    /**
++     * 与えられたチャンクリストを「隣接チャンクを同一グループ」にまとめる Union-Find でリージョンに分割する。
++     * 返却リストの各要素が 1 リージョンのチャンク一覧。
++     */
++    public static List<List<LevelChunk>> buildRegions(List<LevelChunk> chunks) {
++        int size = chunks.size();
++        if (size == 0) return Collections.emptyList();
++        if (size == 1) return Collections.singletonList(chunks);
++
++        // チャンク位置 → インデックスの高速マップ (fastutil Long2Int)
++        it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap posToIndex =
++                new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(size * 2, 0.5f);
++        posToIndex.defaultReturnValue(-1);
++        for (int i = 0; i < size; i++) {
++            posToIndex.put(chunks.get(i).getPos().toLong(), i);
++        }
++
++        // Union-Find 初期化
++        int[] parent = new int[size];
++        int[] rank   = new int[size];
++        for (int i = 0; i < size; i++) parent[i] = i;
++
++        // 4 方向隣接チャンクを結合
++        final int[] DX = {1, -1, 0, 0};
++        final int[] DZ = {0, 0, 1, -1};
++        for (int i = 0; i < size; i++) {
++            ChunkPos pos = chunks.get(i).getPos();
++            for (int d = 0; d < 4; d++) {
++                int neighborIdx = posToIndex.get(ChunkPos.asLong(pos.x + DX[d], pos.z + DZ[d]));
++                if (neighborIdx >= 0) {
++                    union(parent, rank, i, neighborIdx);
++                }
++            }
++        }
++
++        // ルートでグループ化
++        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<List<LevelChunk>> regionMap =
++                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
++        for (int i = 0; i < size; i++) {
++            regionMap.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(chunks.get(i));
++        }
++
++        return new ArrayList<>(regionMap.values());
++    }
++
++    // =========================================================
++    // 並列 tick 実行
++    // =========================================================
++
++    /**
++     * リージョンリストを並列で tick する。
++     * リージョンが 1 つのみの場合は逐次実行にフォールバックする。
++     */
++    public static void tickRegionsParallel(List<List<LevelChunk>> regions, Consumer<LevelChunk> tickAction) {
++        if (regions.isEmpty()) return;
++
++        if (regions.size() == 1) {
++            // リージョン 1 つ → 並列化不要
++            for (LevelChunk chunk : regions.get(0)) {
++                tickAction.accept(chunk);
++            }
++            return;
++        }
++
++        try {
++            SuperVertexThreadPool.TRACKER_POOL.submit(() ->
++                regions.parallelStream().forEach(region -> {
++                    IN_RCT_CONTEXT.set(true);
++                    try {
++                        for (LevelChunk chunk : region) {
++                            tickAction.accept(chunk);
++                        }
++                    } finally {
++                        IN_RCT_CONTEXT.set(false);
++                    }
++                })
++            ).get();
++        } catch (java.util.concurrent.ExecutionException | InterruptedException e) {
++            // エラー時はメインスレッドで逐次フォールバック
++            for (List<LevelChunk> region : regions) {
++                for (LevelChunk chunk : region) {
++                    tickAction.accept(chunk);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 021503b74e78b7ac84f9a91b82f857c47a154e96..6652f9d54a520e1090bc4ca425eac06327a89662 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -150,4 +150,20 @@ public class SuperVertexConfig {
+         chunkTickSpreadFactor = getInt("performance.chunk-tick-spread-factor", chunkTickSpreadFactor);
+         if (chunkTickSpreadFactor < 1) chunkTickSpreadFactor = 1;
+     }
++
++    // =========================================================
++    // Performance: Regionized Chunk Ticking (RCT)
++    // =========================================================
++
++    /**
++     * Regionized Chunk Ticking (RCT) を有効にするかどうか。
++     * プレイヤーが離れた位置にいる場合、それぞれのチャンク領域を並列に tick する。
++     * DivineMC/CanvasMC の実装を参考にした SuperVertex 独自最適化。
++     * 低クロック多コア CPU での大人数サーバーに効果的。
++     */
++    public static boolean regionizedChunkTicking = true;
++
++    private static void regionizedChunkTicking() {
++        regionizedChunkTicking = getBoolean("performance.regionized-chunk-ticking", regionizedChunkTicking);
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index d440b90305675432c89205de6aaba51450c23101..697c1c52b1cedf52b1c12ed848ab02e973bab63a 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -768,6 +768,11 @@ public class ServerChunkCache extends ChunkSource {
+             }
+ 
+             int chunksTicked = 0; // Paper
++            // SuperVertex start - RCT: Phase 1 でスポーン/inhabitedTime を逐次処理しつつ tick 対象を収集する
++            final java.util.List<LevelChunk> rctChunksToTick =
++                dev.supervertex.SuperVertexConfig.regionizedChunkTicking
++                    ? new java.util.ArrayList<>() : null;
++            // SuperVertex end - RCT Phase 1
+             try {
+             while (iterator1.hasNext()) {
+                 LevelChunk chunk1 = iterator1.next();
+@@ -792,7 +797,13 @@ public class ServerChunkCache extends ChunkSource {
+                             || (Math.abs(chunkcoordintpair.x * 1664525 + chunkcoordintpair.z * 1013904223) % spreadFactor)
+                                 == (worlddata.getGameTime() % spreadFactor);
+                         if (shouldTick) {
+-                            this.level.tickChunk(chunk1, k);
++                            if (rctChunksToTick != null) {
++                                // RCT 有効時: Phase 2 で並列処理するために収集
++                                rctChunksToTick.add(chunk1);
++                            } else {
++                                // RCT 無効時: 従来通り逐次実行
++                                this.level.tickChunk(chunk1, k);
++                            }
+                         }
+                         // SuperVertex end - spread chunk ticking
+                         if ((chunksTicked++ & 1) == 0) net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks(); // Paper
+@@ -808,6 +819,16 @@ public class ServerChunkCache extends ChunkSource {
+                 }
+             }
+             // Paper end - optimise chunk tick iteration
++            // SuperVertex start - RCT: Phase 2 リージョン分割 → 並列 tickChunk
++            if (rctChunksToTick != null && !rctChunksToTick.isEmpty()) {
++                final int randomTickSpeed = k; // effectively final for lambda
++                java.util.List<java.util.List<LevelChunk>> regions =
++                    dev.supervertex.RegionizedChunkTicker.buildRegions(rctChunksToTick);
++                dev.supervertex.RegionizedChunkTicker.tickRegionsParallel(regions,
++                    chunk -> this.level.tickChunk(chunk, randomTickSpeed));
++                net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks();
++            }
++            // SuperVertex end - RCT Phase 2
+             //this.level.timings.chunkTicks.stopTiming(); // Paper // Purpur
+             //gameprofilerfiller.popPush("customSpawners"); // Purpur
+             if (flag2) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index c2030d2e936fc5582e3fd1c753e1d0a40b905bab..f2d0518d55812e829d864ddaa4a1bb84ce6a38ff 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -850,6 +850,21 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     private final BlockPos.MutableBlockPos chunkTickMutablePosition = new BlockPos.MutableBlockPos();
+     private final io.papermc.paper.util.math.ThreadUnsafeRandom randomTickRandom = new io.papermc.paper.util.math.ThreadUnsafeRandom(this.random.nextLong()); public net.minecraft.util.RandomSource getThreadUnsafeRandom() { return this.randomTickRandom; } // Pufferfish - moved to super // Purpur - dont break ABI
+     // Paper end
++    // SuperVertex start - RCT: tickChunk 内でスレッドローカルリソースを使う。
++    // RCT ワーカースレッドは RegionizedChunkTicker.IN_RCT_CONTEXT = true になる。
++    // その場合、共有 MutableBlockPos / ThreadUnsafeRandom の競合を避けるため
++    // スレッドローカルのコピーを使用する。
++    private net.minecraft.core.BlockPos.MutableBlockPos getChunkTickPos() {
++        return dev.supervertex.RegionizedChunkTicker.IN_RCT_CONTEXT.get()
++                ? dev.supervertex.RegionizedChunkTicker.RCT_BLOCK_POS.get()
++                : this.chunkTickMutablePosition;
++    }
++    private net.minecraft.util.RandomSource getChunkTickRandom() {
++        return dev.supervertex.RegionizedChunkTicker.IN_RCT_CONTEXT.get()
++                ? dev.supervertex.RegionizedChunkTicker.RCT_RANDOM.get()
++                : this.randomTickRandom;
++    }
++    // SuperVertex end - RCT
+ 
+     private int currentIceAndSnowTick = 0; protected void resetIceAndSnowTick() { this.currentIceAndSnowTick = this.randomTickRandom.nextInt(16); } // Pufferfish
+ 
+@@ -861,7 +876,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         //ProfilerFiller gameprofilerfiller = this.getProfiler(); // Purpur
+ 
+         //gameprofilerfiller.push("thunder"); // Purpur
+-        final BlockPos.MutableBlockPos blockposition = this.chunkTickMutablePosition; // Paper - use mutable to reduce allocation rate, final to force compile fail on change
++        final BlockPos.MutableBlockPos blockposition = this.getChunkTickPos(); // Paper - use mutable to reduce allocation rate, final to force compile fail on change // SuperVertex - RCT thread-local
+ 
+         if (!this.paperConfig().environment.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && /*this.random.nextInt(this.spigotConfig.thunderChance) == 0 &&*/ chunk.shouldDoLightning(this.random)) { // Spigot // Paper - disable thunder // Pufferfish - replace random with shouldDoLightning
+             blockposition.set(this.findLightningTargetAround(this.getBlockRandomPos(j, 0, k, 15))); // Paper
+@@ -954,6 +969,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         if (randomTickSpeed > 0) {
+             LevelChunkSection[] sections = chunk.getSections();
+             int minSection = io.papermc.paper.util.WorldUtil.getMinSection(this);
++            final net.minecraft.util.RandomSource _tickRandom = this.getChunkTickRandom(); // SuperVertex - RCT thread-local random
+             for (int sectionIndex = 0; sectionIndex < sections.length; ++sectionIndex) {
+                 LevelChunkSection section = sections[sectionIndex];
+                 if (section == null || section.tickingList.size() == 0) {
+@@ -963,7 +979,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                 int yPos = (sectionIndex + minSection) << 4;
+                 for (int a = 0; a < randomTickSpeed; ++a) {
+                     int tickingBlocks = section.tickingList.size();
+-                    int index = this.randomTickRandom.nextInt(16 * 16 * 16);
++                    int index = _tickRandom.nextInt(16 * 16 * 16); // SuperVertex - RCT
+                     if (index >= tickingBlocks) {
+                         continue;
+                     }
+@@ -977,7 +993,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                     BlockPos blockposition2 = blockposition.set(j + randomX, randomY, k + randomZ);
+                     BlockState iblockdata = com.destroystokyo.paper.util.maplist.IBlockDataList.getBlockDataFromRaw(raw);
+ 
+-                    iblockdata.randomTick(this, blockposition2, this.randomTickRandom);
++                    iblockdata.randomTick(this, blockposition2, _tickRandom); // SuperVertex - RCT
+                     // We drop the fluid tick since LAVA is ALREADY TICKED by the above method (See LiquidBlock).
+                     // TODO CHECK ON UPDATE (ping the Canadian)
+                 }

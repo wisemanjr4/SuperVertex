@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 14:38:25 +0900
+Subject: [PATCH] SuperVertex: add /sv command registration and config reload
+ support
+
+- Register SuperVertexCommand in Commands dispatcher
+- Add SuperVertexConfig.reload() method for /sv reload
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexCommand.java b/src/main/java/dev/supervertex/SuperVertexCommand.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..76e535cf28e7bd17cb9faf505e3fec556df48143
+--- /dev/null
++++ b/src/main/java/dev/supervertex/SuperVertexCommand.java
+@@ -0,0 +1,24 @@
++package dev.supervertex;
++
++import com.mojang.brigadier.CommandDispatcher;
++import net.minecraft.commands.CommandSourceStack;
++import net.minecraft.commands.Commands;
++import net.minecraft.network.chat.Component;
++
++public class SuperVertexCommand {
++    public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
++        dispatcher.register(Commands.literal("sv")
++                .requires(listener -> listener.hasPermission(4, "supervertex.command"))
++                .then(Commands.literal("reload")
++                        .executes(context -> {
++                            SuperVertexConfig.reload();
++                            context.getSource().sendSuccess(
++                                Component.literal("[SuperVertex] Configuration reloaded."),
++                                false
++                            );
++                            return 1;
++                        })
++                )
++        );
++    }
++}
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 0e364d6aeb6423a6a399ca32b138d293d5961e32..3742b1fab7f333e6a822725deac3f76ea87a3c85 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -231,4 +231,16 @@ public class SuperVertexConfig {
+     private static void permissionCache() {
+         permissionCache = getBoolean("performance.permission-cache", permissionCache);
+     }
++
++    // =========================================================
++    // 設定の再読み込み
++    // =========================================================
++
++    /**
++     * supervertex.yml を再読み込みする。
++     * /sv reload コマンドから呼び出される。
++     */
++    public static void reload() {
++        init(CONFIG_FILE);
++    }
+ }
+diff --git a/src/main/java/net/minecraft/commands/Commands.java b/src/main/java/net/minecraft/commands/Commands.java
+index 08bed4f01a27162902aa63bb8d35a9159fdcfc4e..99c73cc8f56ebe4bf3fba7508fbbc325c43d8625 100644
+--- a/src/main/java/net/minecraft/commands/Commands.java
++++ b/src/main/java/net/minecraft/commands/Commands.java
+@@ -230,6 +230,7 @@ public class Commands {
+             org.purpurmc.purpur.command.CompassCommand.register(this.dispatcher); // Purpur
+             org.purpurmc.purpur.command.RamBarCommand.register(this.dispatcher); // Purpur
+             org.purpurmc.purpur.command.RamCommand.register(this.dispatcher); // Purpur
++            dev.supervertex.SuperVertexCommand.register(this.dispatcher); // SuperVertex
+         }
+ 
+         if (environment.includeIntegrated) {

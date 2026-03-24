@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 03:27:06 +0900
+Subject: [PATCH] SuperVertex: plugin compat fix + async player save
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- CraftServer.getVersion(): "(Plazma)" をバージョン文字列に追加してDecentHolograms等の
+  既知サーバー判定を通過させる (DecentHolograms v2.9.8+ compat)
+- PlayerList.save(): async-player-save=true 時にNBTスナップショットをメインスレッドで生成し
+  ディスク書き込みをSuperVertexThreadPool.TRACKER_POOLで非同期化。
+  ログアウト時のメインスレッドブロック時間を削減。
+- PlayerDataStorage: saveAsync() / writeSnapshot() / awaitPendingSave() を追加。
+  ログイン時に pendingAsyncSaves を確認し同UUID の書き込み完了を待機してデータ競合を防ぐ。
+- SuperVertexConfig: performance.async-player-save (デフォルト: true) を追加。
+  サーバーシャットダウン時は isStopped() チェックにより常に同期保存にフォールバック。
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index ed89fd9b60b29b1e5f5fed03739a1cab747048bb..aec0a1bf26eb034b60df262e2a9de023c1016daf 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -8,7 +8,9 @@ plugins {
+ 
+ dependencies {
+     implementation(project(":supervertex-api")) // Purpur // SuperVertex
+-    implementation("io.papermc.paper:paper-mojangapi:1.19.4-R0.1-SNAPSHOT") // Purpur
++    implementation("io.papermc.paper:paper-mojangapi:1.19.4-R0.1-SNAPSHOT") { // Purpur
++        exclude(group = "io.papermc.paper", module = "paper-api") // SuperVertex - use supervertex-api instead
++    }
+     // Paper start
+     implementation("org.jline:jline-terminal-jansi:3.23.0") // Plazma - Bump Dependencies
+     implementation("net.minecrell:terminalconsoleappender:1.3.0")
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 6652f9d54a520e1090bc4ca425eac06327a89662..398d7fe82728dd3bb05f2c124f56ff3380c2e874 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -166,4 +166,20 @@ public class SuperVertexConfig {
+     private static void regionizedChunkTicking() {
+         regionizedChunkTicking = getBoolean("performance.regionized-chunk-ticking", regionizedChunkTicking);
+     }
++
++    // =========================================================
++    // Performance: Async Player Save
++    // =========================================================
++
++    /**
++     * プレイヤーのデータ保存を非同期スレッドで行うかどうか。
++     * NBTスナップショットはメインスレッドで生成し、ディスク書き込みのみ非同期化する。
++     * 多人数サーバーでのログアウト時ラグスパイクを削減する。
++     * サーバーシャットダウン時は安全のため常に同期保存する。
++     */
++    public static boolean asyncPlayerSave = true;
++
++    private static void asyncPlayerSave() {
++        asyncPlayerSave = getBoolean("performance.async-player-save", asyncPlayerSave);
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/players/PlayerList.java b/src/main/java/net/minecraft/server/players/PlayerList.java
+index 555472cad13c6453090b6f15133bbf2b90014a74..90a23d45967b10ae4ab94b3de85d2a1105df50e5 100644
+--- a/src/main/java/net/minecraft/server/players/PlayerList.java
++++ b/src/main/java/net/minecraft/server/players/PlayerList.java
+@@ -197,6 +197,11 @@ public abstract class PlayerList {
+         String s = (String) optional.map(GameProfile::getName).orElse(gameprofile.getName());
+ 
+         usercache.add(gameprofile);
++        // SuperVertex start - async player save: ログイン前に非同期セーブの完了を待機してデータ競合を防ぐ
++        if (dev.supervertex.SuperVertexConfig.asyncPlayerSave) {
++            this.playerIo.awaitPendingSave(player.getUUID());
++        }
++        // SuperVertex end - async player save
+         CompoundTag nbttagcompound = this.load(player);
+         ResourceKey resourcekey;
+         // CraftBukkit start - Better rename detection
+@@ -558,6 +563,20 @@ public abstract class PlayerList {
+     protected void save(ServerPlayer player) {
+         if (!player.getBukkitEntity().isPersistent()) return; // CraftBukkit
+         player.lastSave = MinecraftServer.currentTick; // Paper
++        // SuperVertex start - async player save
++        if (dev.supervertex.SuperVertexConfig.asyncPlayerSave && !this.server.isStopped()) {
++            this.playerIo.saveAsync(player);
++            ServerStatsCounter asyncStats = (ServerStatsCounter) player.getStats();
++            if (asyncStats != null) {
++                dev.supervertex.SuperVertexThreadPool.TRACKER_POOL.submit(asyncStats::save);
++            }
++            PlayerAdvancements asyncAdv = (PlayerAdvancements) player.getAdvancements();
++            if (asyncAdv != null) {
++                dev.supervertex.SuperVertexThreadPool.TRACKER_POOL.submit(asyncAdv::save);
++            }
++            return;
++        }
++        // SuperVertex end - async player save
+         this.playerIo.save(player);
+         ServerStatsCounter serverstatisticmanager = (ServerStatsCounter) player.getStats(); // CraftBukkit
+ 
+diff --git a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+index e9db2ee5819f6b81973472ea74bc0708612e30be..1d3d678030baf2e3704a4c217e883e6c9e85f68c 100644
+--- a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -23,6 +23,10 @@ public class PlayerDataStorage {
+ 
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final File playerDir;
++    // SuperVertex start - async player save: track in-flight save futures per UUID
++    public final java.util.concurrent.ConcurrentHashMap<java.util.UUID, java.util.concurrent.CompletableFuture<Void>> pendingAsyncSaves =
++            new java.util.concurrent.ConcurrentHashMap<>();
++    // SuperVertex end
+     protected final DataFixer fixerUpper;
+ 
+     public PlayerDataStorage(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer) {
+@@ -48,6 +52,60 @@ public class PlayerDataStorage {
+ 
+     }
+ 
++    // SuperVertex start - async player save
++    /**
++     * メインスレッドでNBTスナップショットを生成し、ディスク書き込みを非同期スレッドで行う。
++     * プレイヤーのログアウト処理のメインスレッドブロック時間を削減する。
++     */
++    public void saveAsync(ServerPlayer player) {
++        if (org.spigotmc.SpigotConfig.disablePlayerDataSaving) return;
++        // スナップショットはメインスレッドで生成（スレッドセーフ）
++        final CompoundTag snapshot;
++        try {
++            snapshot = player.saveWithoutId(new CompoundTag());
++        } catch (Exception e) {
++            PlayerDataStorage.LOGGER.warn("Failed to snapshot player data for {}, falling back to sync save", player.getScoreboardName(), e);
++            this.save(player);
++            return;
++        }
++        final java.util.UUID uuid = player.getUUID();
++        final String uuidStr = player.getStringUUID();
++        // ディスク書き込みのみ非同期で実行
++        java.util.concurrent.CompletableFuture<Void> future = java.util.concurrent.CompletableFuture.runAsync(() -> {
++            this.writeSnapshot(snapshot, uuidStr);
++        }, dev.supervertex.SuperVertexThreadPool.TRACKER_POOL);
++        this.pendingAsyncSaves.put(uuid, future);
++        future.whenComplete((v, ex) -> this.pendingAsyncSaves.remove(uuid));
++    }
++
++    private void writeSnapshot(CompoundTag snapshot, String uuidStr) {
++        try {
++            File tempFile = File.createTempFile(uuidStr + "-", ".dat", this.playerDir);
++            NbtIo.writeCompressed(snapshot, tempFile);
++            File target = new File(this.playerDir, uuidStr + ".dat");
++            File backup = new File(this.playerDir, uuidStr + ".dat_old");
++            Util.safeReplaceFile(target, tempFile, backup);
++        } catch (Exception e) {
++            PlayerDataStorage.LOGGER.warn("Failed to async write player data for {}", uuidStr, e);
++        }
++    }
++
++    /**
++     * 指定UUIDの非同期セーブが進行中の場合、完了を待機する。
++     * ログイン時に呼び出すことでデータ競合を防ぐ。
++     */
++    public void awaitPendingSave(java.util.UUID uuid) {
++        java.util.concurrent.CompletableFuture<Void> pending = this.pendingAsyncSaves.remove(uuid);
++        if (pending != null && !pending.isDone()) {
++            try {
++                pending.get(5, java.util.concurrent.TimeUnit.SECONDS);
++            } catch (Exception e) {
++                PlayerDataStorage.LOGGER.warn("Timed out waiting for async player save for {}", uuid, e);
++            }
++        }
++    }
++    // SuperVertex end - async player save
++
+     @Nullable
+     public CompoundTag load(Player player) {
+         CompoundTag nbttagcompound = null;
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index a44b756630d5bb77d812bfc7a8ae697ce95403fb..a0ad2a0e79056535e382a234586142eeb4dd9210 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -587,7 +587,7 @@ public final class CraftServer implements Server {
+ 
+     @Override
+     public String getVersion() {
+-        return this.serverVersion + " (MC: " + this.console.getServerVersion() + ")";
++        return this.serverVersion + " (Plazma) (MC: " + this.console.getServerVersion() + ")"; // SuperVertex - plugin compat: include known upstream names
+     }
+ 
+     @Override

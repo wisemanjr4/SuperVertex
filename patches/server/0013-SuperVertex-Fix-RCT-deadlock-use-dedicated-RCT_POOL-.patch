@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 16:33:20 +0900
+Subject: [PATCH] SuperVertex: Fix RCT deadlock - use dedicated RCT_POOL +
+ CountDownLatch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+旧実装の問題:
+  TRACKER_POOL.submit(parallelStream).get() でデッドロック発生。
+  エンティティトラッカーが TRACKER_POOL の全ワーカーを占有すると
+  RCT の parallelStream サブタスクが実行できずプール飢餓となり、
+  メインスレッドが .get() で永久ブロックされていた。
+
+修正内容:
+  - SuperVertexThreadPool: TRACKER_POOL とは独立した RCT_POOL を追加
+    (ForkJoinPool, スレッド数 = max(2, cores - 1))
+  - RegionizedChunkTicker: parallelStream + .get() を CountDownLatch 方式に変更
+    * regions[0] はメインスレッドが直接処理 (コンテキストスイッチ節約)
+    * regions[1..] を RCT_POOL ワーカーへ distribute
+    * CountDownLatch で全ワーカー完了を待機
+    * ワーカーエラーは AtomicReference で捕捉しログ記録
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index 3e5fb7659fbdb1da27272d268634be721cf41ef8..a809d94a55ed63ebf1df2150494728f8a2adb9ed 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -123,6 +123,14 @@ public final class RegionizedChunkTicker {
+     /**
+      * リージョンリストを並列で tick する。
+      * リージョンが 1 つのみの場合は逐次実行にフォールバックする。
++     *
++     * 修正済み (デッドロック対策):
++     *   - 旧実装: TRACKER_POOL.submit(parallelStream).get()
++     *     → エンティティトラッカーとプールを共有しているため、トラッカータスクが
++     *       全ワーカーを占有するとプール飢餓デッドロックが発生していた。
++     *   - 新実装: RCT 専用の RCT_POOL + CountDownLatch
++     *     → TRACKER_POOL と完全に分離し、メインスレッドは regions[0] を自ら処理
++     *       することでスレッドを節約しつつ全リージョンが完了するまで待機する。
+      */
+     public static void tickRegionsParallel(List<List<LevelChunk>> regions, Consumer<LevelChunk> tickAction) {
+         if (regions.isEmpty()) return;
+@@ -135,26 +143,46 @@ public final class RegionizedChunkTicker {
+             return;
+         }
+ 
+-        try {
+-            SuperVertexThreadPool.TRACKER_POOL.submit(() ->
+-                regions.parallelStream().forEach(region -> {
+-                    IN_RCT_CONTEXT.set(true);
+-                    try {
+-                        for (LevelChunk chunk : region) {
+-                            tickAction.accept(chunk);
+-                        }
+-                    } finally {
+-                        IN_RCT_CONTEXT.set(false);
++        // regions[1..] を RCT_POOL ワーカーへ委ねる
++        int workerCount = regions.size() - 1;
++        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(workerCount);
++        java.util.concurrent.atomic.AtomicReference<Throwable> firstError =
++                new java.util.concurrent.atomic.AtomicReference<>();
++
++        for (int i = 1; i < regions.size(); i++) {
++            final List<LevelChunk> region = regions.get(i);
++            SuperVertexThreadPool.RCT_POOL.execute(() -> {
++                IN_RCT_CONTEXT.set(true);
++                try {
++                    for (LevelChunk chunk : region) {
++                        tickAction.accept(chunk);
+                     }
+-                })
+-            ).get();
+-        } catch (java.util.concurrent.ExecutionException | InterruptedException e) {
+-            // エラー時はメインスレッドで逐次フォールバック
+-            for (List<LevelChunk> region : regions) {
+-                for (LevelChunk chunk : region) {
+-                    tickAction.accept(chunk);
++                } catch (Throwable t) {
++                    firstError.compareAndSet(null, t);
++                } finally {
++                    IN_RCT_CONTEXT.set(false);
++                    latch.countDown();
+                 }
+-            }
++            });
++        }
++
++        // メインスレッドは regions[0] をそのまま処理（コンテキストスイッチを節約）
++        for (LevelChunk chunk : regions.get(0)) {
++            tickAction.accept(chunk);
++        }
++
++        // 全ワーカーの完了を待機
++        try {
++            latch.await();
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++
++        // ワーカーでエラーが発生した場合はログに記録
++        Throwable t = firstError.get();
++        if (t != null) {
++            org.apache.logging.log4j.LogManager.getLogger("SuperVertex/RCT")
++                    .error("RCT worker error during chunk tick", t);
+         }
+     }
+ }
+diff --git a/src/main/java/dev/supervertex/SuperVertexThreadPool.java b/src/main/java/dev/supervertex/SuperVertexThreadPool.java
+index 912d2fe7e7a0ccc4209bc0b954ed0621ea262183..005d34bfa18f0b332e206a53171d74b1516400bf 100644
+--- a/src/main/java/dev/supervertex/SuperVertexThreadPool.java
++++ b/src/main/java/dev/supervertex/SuperVertexThreadPool.java
+@@ -18,13 +18,23 @@ public final class SuperVertexThreadPool {
+      */
+     public static volatile ForkJoinPool TRACKER_POOL = createPool("supervertex-tracker");
+ 
++    /**
++     * RCT (Regionized Chunk Ticking) 専用スレッドプール。
++     * TRACKER_POOL と分離することで、エンティティトラッカーによるプール飢餓デッドロックを防ぐ。
++     */
++    public static volatile ForkJoinPool RCT_POOL = createPool("supervertex-rct",
++            Math.max(2, Runtime.getRuntime().availableProcessors() - 1));
++
+     /**
+      * 設定に基づいてスレッドプールを再初期化する。
+      * サーバー起動時に SuperVertexConfig.init() 後に呼ぶこと。
+      */
+     public static void init() {
+         int size = SuperVertexConfig.asyncThreadPoolSize;
+-        TRACKER_POOL = createPool("supervertex-tracker", size);
++        TRACKER_POOL = createPool("supervertex-tracker",
++                size > 0 ? size : Math.max(2, Runtime.getRuntime().availableProcessors()));
++        RCT_POOL = createPool("supervertex-rct",
++                Math.max(2, Runtime.getRuntime().availableProcessors() - 1));
+     }
+ 
+     private static ForkJoinPool createPool(String namePrefix) {

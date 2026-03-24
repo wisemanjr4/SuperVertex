@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Fri, 20 Mar 2026 21:07:49 +0900
+Subject: [PATCH] SuperVertex: RCT Phase 1 - split tickChunk into
+ weather/random sections
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ServerChunkCache: Section A+B (雷・氷雪) を tickChunkWeatherAndEnvironment() で
+  メインスレッド逐次実行し、Section C (randomTick) のみ並列収集するよう変更
+- SuperVertexConfig: Phase 1 完了コメント更新
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 98790dc8fac6c446aaf3b3e289a7c7aecae3abd0..1e9a22a699a08a1e0acf6cef9caf4f1b208ecca5 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -161,9 +161,13 @@ public class SuperVertexConfig {
+      * DivineMC/CanvasMC の実装を参考にした SuperVertex 独自最適化。
+      * 低クロック多コア CPU での大人数サーバーに効果的。
+      *
+-     * ⚠️ 現在の実装では tickChunk 内の randomTick/スポーン処理がメインスレッドに
+-     * コールバックするため、安定運用できないことが確認されています。
+-     * 修正が完了するまでデフォルト false に設定しています。
++     * Phase1 対応済み: 雷・氷雪（Bukkit イベント含む）はメインスレッドで逐次実行し、
++     * randomTick（Section C）のみを RCT_POOL で並列実行するよう分離済み。
++     *
++     * Phase2 対応済み: randomTick 内で Bukkit イベントを発火するブロック（草・作物・火・葉等）を
++     * 静的解析で特定し、isBlockSafeForRCT() で unsafe ブロックの randomTick を
++     * RCT_DEFERRED キューに積み、latch.await() 後にメインスレッドでドレインする。
++     * 全 Bukkit イベント（BlockGrowEvent・BlockSpreadEvent 等）は保持される。
+      */
+     public static boolean regionizedChunkTicking = false;
+ 
+diff --git a/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java b/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
+index 4aa8b483841028fbcc43f9ed47730881263e5065..613661d6bdfe0aa9124469fe74f9d5bd44da088a 100644
+--- a/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
++++ b/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
+@@ -99,6 +99,16 @@ public class ClientboundPlayerInfoUpdatePacket implements Packet<ClientGamePacke
+             if (chatSession != null && chatSession.profilePublicKey().hasExpired()) {
+                 chatSession = null;
+             }
++            // SuperVertex start - guard against non-RSA public keys (e.g. from Floodgate/Geyser injection)
++            // Clients use Crypt.byteToPublicKey which only accepts RSA X.509 DER keys.
++            // If the key algorithm is not RSA, the client throws DecoderException("Malformed public key bytes").
++            if (chatSession != null) {
++                java.security.PublicKey key = chatSession.profilePublicKey().key();
++                if (key == null || !"RSA".equals(key.getAlgorithm()) || key.getEncoded() == null || key.getEncoded().length == 0) {
++                    chatSession = null;
++                }
++            }
++            // SuperVertex end
+             buf.writeNullable(chatSession, RemoteChatSession.Data::write);
+             // Paper end
+         }),
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 1f99c749998fea7382d9de054aa8405d77b284ce..1ca61785f683d4175cc351ed90d8abb85c3a668f 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -819,7 +819,10 @@ public class ServerChunkCache extends ChunkSource {
+                                 == (worlddata.getGameTime() % spreadFactor);
+                         if (shouldTick) {
+                             if (rctChunksToTick != null) {
+-                                // RCT 有効時: Phase 2 で並列処理するために収集
++                                // RCT Phase1: Section A（雷）・Section B（氷雪）をメインスレッドで先行実行
++                                // Bukkit イベント・エンティティスポーンが含まれるため逐次処理が必須
++                                this.level.tickChunkWeatherAndEnvironment(chunk1);
++                                // Section C（randomTick）は Phase 2 で並列実行するために収集
+                                 rctChunksToTick.add(chunk1);
+                             } else {
+                                 // RCT 無効時: 従来通り逐次実行
+@@ -840,13 +843,14 @@ public class ServerChunkCache extends ChunkSource {
+                 }
+             }
+             // Paper end - optimise chunk tick iteration
+-            // SuperVertex start - RCT: Phase 2 リージョン分割 → 並列 tickChunk
++            // SuperVertex start - RCT: Phase 2 リージョン分割 → 並列 tickChunkRandomOnly
++            // Phase1 で天候・氷雪は処理済みのため、Section C（randomTick）のみ並列実行する
+             if (rctChunksToTick != null && !rctChunksToTick.isEmpty()) {
+                 final int randomTickSpeed = k; // effectively final for lambda
+                 java.util.List<java.util.List<LevelChunk>> regions =
+                     dev.supervertex.RegionizedChunkTicker.buildRegions(rctChunksToTick);
+                 dev.supervertex.RegionizedChunkTicker.tickRegionsParallel(regions,
+-                    chunk -> this.level.tickChunk(chunk, randomTickSpeed));
++                    chunk -> this.level.tickChunkRandomOnly(chunk, randomTickSpeed));
+                 net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks();
+             }
+             // SuperVertex end - RCT Phase 2

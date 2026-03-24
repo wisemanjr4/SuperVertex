@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 16:49:49 +0900
+Subject: [PATCH] SuperVertex: Disable RCT by default - tickChunk is not
+ thread-safe
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tickChunk 内の randomTick/エンティティスポーンがメインスレッドへの
+コールバックを発生させるため、並列実行すると CountDownLatch が永久に
+解放されないデッドロックが発生する。
+
+安全な並列化の実装が完了するまで regionized-chunk-ticking のデフォルトを
+false に変更する。
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 3742b1fab7f333e6a822725deac3f76ea87a3c85..98790dc8fac6c446aaf3b3e289a7c7aecae3abd0 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -160,8 +160,12 @@ public class SuperVertexConfig {
+      * プレイヤーが離れた位置にいる場合、それぞれのチャンク領域を並列に tick する。
+      * DivineMC/CanvasMC の実装を参考にした SuperVertex 独自最適化。
+      * 低クロック多コア CPU での大人数サーバーに効果的。
++     *
++     * ⚠️ 現在の実装では tickChunk 内の randomTick/スポーン処理がメインスレッドに
++     * コールバックするため、安定運用できないことが確認されています。
++     * 修正が完了するまでデフォルト false に設定しています。
+      */
+-    public static boolean regionizedChunkTicking = true;
++    public static boolean regionizedChunkTicking = false;
+ 
+     private static void regionizedChunkTicking() {
+         regionizedChunkTicking = getBoolean("performance.regionized-chunk-ticking", regionizedChunkTicking);

@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Fri, 20 Mar 2026 21:08:03 +0900
+Subject: [PATCH] SuperVertex: RCT Phase 2 - defer unsafe blocks to main thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+randomTick 内で CraftEventFactory (Bukkit イベント) を発火する 18 種のブロックを
+静的解析で特定し、RCT ワーカーから安全に除外する仕組みを実装。
+
+変更内容:
+- RegionizedChunkTicker: RCT_DEFERRED ThreadLocal キュー + ALL_DEFERRED
+  グローバルキュー追加。latch.await() 後にメインスレッドでドレイン。
+  isBlockSafeForRCT() で unsafe ブロック一覧を管理。
+- ServerLevel.tickChunkRandomOnly: IN_RCT_CONTEXT 時、unsafe ブロックの
+  randomTick を RCT_DEFERRED に積む (BlockPos.immutable() でキャプチャ)。
+
+対象 unsafe ブロック (CraftEventFactory 呼び出し確認済み):
+  VineBlock, TurtleEggBlock, SweetBerryBushBlock, StemBlock, SugarCaneBlock,
+  SpreadingSnowyDirtBlock, SnowLayerBlock, LeavesBlock, CropBlock, CocoaBlock,
+  ChorusFlowerBlock, CactusBlock, BambooStalkBlock, BambooSaplingBlock,
+  RedStoneOreBlock, GrowingPlantHeadBlock, NetherWartBlock, BaseFireBlock
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index a809d94a55ed63ebf1df2150494728f8a2adb9ed..ff39742380441563a132cc835b0b27c1e4a18fbe 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -116,6 +116,61 @@ public final class RegionizedChunkTicker {
+         return new ArrayList<>(regionMap.values());
+     }
+ 
++    // =========================================================
++    // Phase 2: Bukkit イベントを発火するブロックの Deferred 実行
++    // =========================================================
++
++    /**
++     * ワーカースレッドが「メインスレッドで実行してほしい randomTick」を積むキュー。
++     * tickChunkRandomOnly() が IN_RCT_CONTEXT == true のとき、
++     * Bukkit イベントを発火する unsafe ブロックをここに積む。
++     * tickRegionsParallel の latch.await() 後にメインスレッドでドレインする。
++     */
++    public static final ThreadLocal<java.util.ArrayDeque<Runnable>> RCT_DEFERRED =
++            ThreadLocal.withInitial(java.util.ArrayDeque::new);
++
++    /**
++     * 全ワーカーの RCT_DEFERRED キューをまとめるグローバルコレクション。
++     * ワーカー起動時に登録し、ドレイン後にクリアする。
++     */
++    public static final java.util.concurrent.ConcurrentLinkedQueue<java.util.ArrayDeque<Runnable>> ALL_DEFERRED =
++            new java.util.concurrent.ConcurrentLinkedQueue<>();
++
++    /**
++     * ブロックが RCT ワーカースレッドから安全に randomTick できるかを返す。
++     *
++     * 以下のブロックは randomTick 内で CraftEventFactory（Bukkit イベント）を呼ぶため
++     * メインスレッドへの Deferred 実行が必要:
++     *   VineBlock, TurtleEggBlock, SweetBerryBushBlock, StemBlock (MelonStem/PumpkinStem),
++     *   SugarCaneBlock, SpreadingSnowyDirtBlock (Grass/Mycelium), SnowLayerBlock,
++     *   LeavesBlock, CropBlock (Wheat/Carrot/Potato 等), CocoaBlock, ChorusFlowerBlock,
++     *   CactusBlock, BambooStalkBlock, BambooSaplingBlock, RedStoneOreBlock,
++     *   GrowingPlantHeadBlock (Kelp/TwistingVines/WeepingVines 等), NetherWartBlock,
++     *   BaseFireBlock (FireBlock)
++     *
++     * @return true = 並列実行安全、false = メインスレッドへ Defer が必要
++     */
++    public static boolean isBlockSafeForRCT(net.minecraft.world.level.block.Block block) {
++        return !(block instanceof net.minecraft.world.level.block.VineBlock
++              || block instanceof net.minecraft.world.level.block.TurtleEggBlock
++              || block instanceof net.minecraft.world.level.block.SweetBerryBushBlock
++              || block instanceof net.minecraft.world.level.block.StemBlock
++              || block instanceof net.minecraft.world.level.block.SugarCaneBlock
++              || block instanceof net.minecraft.world.level.block.SpreadingSnowyDirtBlock
++              || block instanceof net.minecraft.world.level.block.SnowLayerBlock
++              || block instanceof net.minecraft.world.level.block.LeavesBlock
++              || block instanceof net.minecraft.world.level.block.CropBlock
++              || block instanceof net.minecraft.world.level.block.CocoaBlock
++              || block instanceof net.minecraft.world.level.block.ChorusFlowerBlock
++              || block instanceof net.minecraft.world.level.block.CactusBlock
++              || block instanceof net.minecraft.world.level.block.BambooStalkBlock
++              || block instanceof net.minecraft.world.level.block.BambooSaplingBlock
++              || block instanceof net.minecraft.world.level.block.RedStoneOreBlock
++              || block instanceof net.minecraft.world.level.block.GrowingPlantHeadBlock
++              || block instanceof net.minecraft.world.level.block.NetherWartBlock
++              || block instanceof net.minecraft.world.level.block.BaseFireBlock);
++    }
++
+     // =========================================================
+     // 並列 tick 実行
+     // =========================================================
+@@ -124,19 +179,16 @@ public final class RegionizedChunkTicker {
+      * リージョンリストを並列で tick する。
+      * リージョンが 1 つのみの場合は逐次実行にフォールバックする。
+      *
+-     * 修正済み (デッドロック対策):
+-     *   - 旧実装: TRACKER_POOL.submit(parallelStream).get()
+-     *     → エンティティトラッカーとプールを共有しているため、トラッカータスクが
+-     *       全ワーカーを占有するとプール飢餓デッドロックが発生していた。
+-     *   - 新実装: RCT 専用の RCT_POOL + CountDownLatch
+-     *     → TRACKER_POOL と完全に分離し、メインスレッドは regions[0] を自ら処理
+-     *       することでスレッドを節約しつつ全リージョンが完了するまで待機する。
++     * Phase 2 対応:
++     *   ワーカーは unsafe ブロックの randomTick を RCT_DEFERRED に積む。
++     *   latch.await() 完了後にメインスレッドで ALL_DEFERRED をドレインし、
++     *   全 Bukkit イベントをメインスレッドで正しく発火する。
+      */
+     public static void tickRegionsParallel(List<List<LevelChunk>> regions, Consumer<LevelChunk> tickAction) {
+         if (regions.isEmpty()) return;
+ 
+         if (regions.size() == 1) {
+-            // リージョン 1 つ → 並列化不要
++            // リージョン 1 つ → 並列化不要（メインスレッドで直接実行）
+             for (LevelChunk chunk : regions.get(0)) {
+                 tickAction.accept(chunk);
+             }
+@@ -153,6 +205,10 @@ public final class RegionizedChunkTicker {
+             final List<LevelChunk> region = regions.get(i);
+             SuperVertexThreadPool.RCT_POOL.execute(() -> {
+                 IN_RCT_CONTEXT.set(true);
++                // Phase 2: ワーカーの Deferred キューをグローバルに登録
++                java.util.ArrayDeque<Runnable> deferred = RCT_DEFERRED.get();
++                deferred.clear(); // 前回の残留を除去
++                ALL_DEFERRED.add(deferred);
+                 try {
+                     for (LevelChunk chunk : region) {
+                         tickAction.accept(chunk);
+@@ -166,7 +222,8 @@ public final class RegionizedChunkTicker {
+             });
+         }
+ 
+-        // メインスレッドは regions[0] をそのまま処理（コンテキストスイッチを節約）
++        // メインスレッドは regions[0] をそのまま処理（IN_RCT_CONTEXT = false のまま）
++        // → unsafe ブロックも即時実行されるため Defer 不要
+         for (LevelChunk chunk : regions.get(0)) {
+             tickAction.accept(chunk);
+         }
+@@ -178,6 +235,21 @@ public final class RegionizedChunkTicker {
+             Thread.currentThread().interrupt();
+         }
+ 
++        // Phase 2: ワーカーが積んだ unsafe ブロックの randomTick をメインスレッドでドレイン
++        // （CraftEventFactory 呼び出しが全てメインスレッドで安全に実行される）
++        for (java.util.ArrayDeque<Runnable> deferred : ALL_DEFERRED) {
++            Runnable action;
++            while ((action = deferred.poll()) != null) {
++                try {
++                    action.run();
++                } catch (Throwable t) {
++                    org.apache.logging.log4j.LogManager.getLogger("SuperVertex/RCT")
++                            .error("RCT deferred action error", t);
++                }
++            }
++        }
++        ALL_DEFERRED.clear();
++
+         // ワーカーでエラーが発生した場合はログに記録
+         Throwable t = firstError.get();
+         if (t != null) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index f2d0518d55812e829d864ddaa4a1bb84ce6a38ff..a684bb62e478386b7540c901f928963a9ab3c266 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -1004,6 +1004,140 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         //gameprofilerfiller.pop(); // Purpur
+     }
+ 
++    // SuperVertex start - RCT Phase1: 天候・氷雪処理（メインスレッド専用）
++    // Section A（雷・馬スポーン）+ Section B（氷雪形成）のみ。
++    // randomTick (Section C) は tickChunkRandomOnly() で並列実行する。
++    // このメソッドはメインスレッドからのみ呼ばれるため、共有インスタンスを直接使用する。
++    public void tickChunkWeatherAndEnvironment(LevelChunk chunk) {
++        ChunkPos chunkcoordintpair = chunk.getPos();
++        boolean flag = this.isRaining();
++        int j = chunkcoordintpair.getMinBlockX();
++        int k = chunkcoordintpair.getMinBlockZ();
++        final BlockPos.MutableBlockPos blockposition = this.chunkTickMutablePosition;
++
++        // Section A: 雷・スケルトン馬スポーン
++        if (!this.paperConfig().environment.disableThunder && flag && this.isThundering() && this.spigotConfig.thunderChance > 0 && chunk.shouldDoLightning(this.random)) {
++            blockposition.set(this.findLightningTargetAround(this.getBlockRandomPos(j, 0, k, 15)));
++            if (this.isRainingAt(blockposition)) {
++                DifficultyInstance difficultydamagescaler = this.getCurrentDifficultyAt(blockposition);
++                boolean flag1 = this.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && this.random.nextDouble() < (double) difficultydamagescaler.getEffectiveDifficulty() * this.paperConfig().entities.spawning.skeletonHorseThunderSpawnChance.or(0.01D) && !this.getBlockState(blockposition.below()).is(Blocks.LIGHTNING_ROD);
++
++                if (flag1) {
++                    net.minecraft.world.entity.animal.horse.AbstractHorse entityhorseskeleton;
++                    if (purpurConfig.zombieHorseSpawnChance > 0D && random.nextDouble() <= purpurConfig.zombieHorseSpawnChance) {
++                        entityhorseskeleton = EntityType.ZOMBIE_HORSE.create(this);
++                    } else {
++                        entityhorseskeleton = EntityType.SKELETON_HORSE.create(this);
++                        if (entityhorseskeleton != null) ((SkeletonHorse) entityhorseskeleton).setTrap(true);
++                    }
++                    if (entityhorseskeleton != null) {
++                        entityhorseskeleton.setAge(0);
++                        entityhorseskeleton.setPos((double) blockposition.getX(), (double) blockposition.getY(), (double) blockposition.getZ());
++                        this.addFreshEntity(entityhorseskeleton, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason.LIGHTNING);
++                    }
++                }
++
++                LightningBolt entitylightning = (LightningBolt) EntityType.LIGHTNING_BOLT.create(this);
++                if (entitylightning != null) {
++                    entitylightning.moveTo(Vec3.atBottomCenterOf(blockposition));
++                    entitylightning.setVisualOnly(flag1);
++                    this.strikeLightning(entitylightning, org.bukkit.event.weather.LightningStrikeEvent.Cause.WEATHER);
++                }
++            }
++        }
++
++        // Section B: 氷・雪形成
++        int l;
++        if (!this.paperConfig().environment.disableIceAndSnow && (this.currentIceAndSnowTick++ & 15) == 0) {
++            this.getRandomBlockPosition(j, 0, k, 15, blockposition);
++            int normalY = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING, blockposition.getX() & 15, blockposition.getZ() & 15) + 1;
++            int downY = normalY - 1;
++            blockposition.setY(normalY);
++            Biome biomebase = (Biome) this.getBiome(blockposition).value();
++
++            blockposition.setY(downY);
++            if (biomebase.shouldFreeze(this, blockposition)) {
++                org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(this, blockposition, Blocks.ICE.defaultBlockState(), null);
++            }
++
++            if (flag) {
++                int i1 = this.getGameRules().getInt(GameRules.RULE_SNOW_ACCUMULATION_HEIGHT);
++                blockposition.setY(normalY);
++                if (i1 > 0 && biomebase.shouldSnow(this, blockposition)) {
++                    BlockState iblockdata = this.getBlockState(blockposition);
++                    if (iblockdata.is(Blocks.SNOW)) {
++                        l = (Integer) iblockdata.getValue(SnowLayerBlock.LAYERS);
++                        if (l < Math.min(i1, 8)) {
++                            BlockState iblockdata1 = (BlockState) iblockdata.setValue(SnowLayerBlock.LAYERS, l + 1);
++                            Block.pushEntitiesUp(iblockdata, iblockdata1, this, blockposition);
++                            org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(this, blockposition, iblockdata1, null);
++                        }
++                    } else {
++                        org.bukkit.craftbukkit.event.CraftEventFactory.handleBlockFormEvent(this, blockposition, Blocks.SNOW.defaultBlockState(), null);
++                    }
++                }
++                blockposition.setY(downY);
++
++                Biome.Precipitation biomebase_precipitation = biomebase.getPrecipitationAt(blockposition);
++                if (biomebase_precipitation != Biome.Precipitation.NONE) {
++                    BlockState iblockdata2 = this.getBlockState(blockposition);
++                    iblockdata2.getBlock().handlePrecipitation(iblockdata2, this, blockposition, biomebase_precipitation);
++                }
++            }
++        }
++    }
++    // SuperVertex end - RCT Phase1: tickChunkWeatherAndEnvironment
++
++    // SuperVertex start - RCT Phase1+2: ランダムブロックティックのみ（スレッドセーフ）
++    // Section C のみ。スレッドローカルリソースを使うため RCT_POOL から並列実行可能。
++    // Phase 2: Bukkit イベントを発火する unsafe ブロックは RCT_DEFERRED に積み、
++    //          latch.await() 後にメインスレッドでドレインする。
++    public void tickChunkRandomOnly(LevelChunk chunk, int randomTickSpeed) {
++        if (randomTickSpeed <= 0) return;
++        ChunkPos chunkcoordintpair = chunk.getPos();
++        int j = chunkcoordintpair.getMinBlockX();
++        int k = chunkcoordintpair.getMinBlockZ();
++        LevelChunkSection[] sections = chunk.getSections();
++        int minSection = io.papermc.paper.util.WorldUtil.getMinSection(this);
++        final net.minecraft.util.RandomSource _tickRandom = this.getChunkTickRandom();
++        final BlockPos.MutableBlockPos blockposition = this.getChunkTickPos();
++        // Phase 2: RCT ワーカー時のみ Deferred キューを使用（メインスレッドは null → 直接実行）
++        final boolean inRCT = dev.supervertex.RegionizedChunkTicker.IN_RCT_CONTEXT.get();
++        final java.util.ArrayDeque<Runnable> deferredActions =
++                inRCT ? dev.supervertex.RegionizedChunkTicker.RCT_DEFERRED.get() : null;
++        for (int sectionIndex = 0; sectionIndex < sections.length; ++sectionIndex) {
++            LevelChunkSection section = sections[sectionIndex];
++            if (section == null || section.tickingList.size() == 0) {
++                continue;
++            }
++            int yPos = (sectionIndex + minSection) << 4;
++            for (int a = 0; a < randomTickSpeed; ++a) {
++                int tickingBlocks = section.tickingList.size();
++                int index = _tickRandom.nextInt(16 * 16 * 16);
++                if (index >= tickingBlocks) {
++                    continue;
++                }
++                long raw = section.tickingList.getRaw(index);
++                int location = com.destroystokyo.paper.util.maplist.IBlockDataList.getLocationFromRaw(raw);
++                int randomX = location & 15;
++                int randomY = ((location >>> (4 + 4)) & 255) | yPos;
++                int randomZ = (location >>> 4) & 15;
++                BlockState iblockdata = com.destroystokyo.paper.util.maplist.IBlockDataList.getBlockDataFromRaw(raw);
++                // Phase 2: Bukkit イベントを発火する unsafe ブロックはメインスレッドへ Defer
++                if (inRCT && !dev.supervertex.RegionizedChunkTicker.isBlockSafeForRCT(iblockdata.getBlock())) {
++                    final int fx = j + randomX, fy = randomY, fz = k + randomZ;
++                    final BlockState fs = iblockdata;
++                    deferredActions.add(() -> fs.randomTick(this, new BlockPos(fx, fy, fz), this.randomTickRandom));
++                    continue;
++                }
++                iblockdata.randomTick(this, blockposition.set(j + randomX, randomY, k + randomZ), _tickRandom);
++                // We drop the fluid tick since LAVA is ALREADY TICKED by the above method (See LiquidBlock).
++                // TODO CHECK ON UPDATE (ping the Canadian)
++            }
++        }
++    }
++    // SuperVertex end - RCT Phase1+2: tickChunkRandomOnly
++
+     public Optional<BlockPos> findLightningRod(BlockPos pos) {
+         Optional<BlockPos> optional = this.getPoiManager().findClosest((holder) -> {
+             return holder.is(PoiTypes.LIGHTNING_ROD);

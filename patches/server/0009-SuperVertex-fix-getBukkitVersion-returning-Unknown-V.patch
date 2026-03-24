@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 03:34:01 +0900
+Subject: [PATCH] SuperVertex: fix getBukkitVersion() returning Unknown-Version
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Versioning.java が Plazma の pom.properties パス
+(META-INF/maven/org.plazmamc.plazma/plazma-api/pom.properties) を
+参照していたため、SuperVertex-API (dev.supervertex/supervertex-api) では
+ファイルが見つからず "Unknown-Version" を返していた。
+
+正しいパス META-INF/maven/dev.supervertex/supervertex-api/pom.properties
+に修正。DecentHolograms 等のプラグインが getBukkitVersion() で
+Minecraft バージョン ("1.19.4-R0.1-SNAPSHOT") を取得できるようになる。
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/Versioning.java b/src/main/java/org/bukkit/craftbukkit/util/Versioning.java
+index 0e695ea608c4e4770f5491d54ad47616d4e857c6..befcf4e0dc118ccc4e98fab8060b007aeeaf8ff8 100644
+--- a/src/main/java/org/bukkit/craftbukkit/util/Versioning.java
++++ b/src/main/java/org/bukkit/craftbukkit/util/Versioning.java
+@@ -8,10 +8,10 @@ import java.util.logging.Logger;
+ import org.bukkit.Bukkit;
+ 
+ public final class Versioning {
+-    // Plazma start
++    // Plazma start // SuperVertex - fix pom.properties path to match dev.supervertex group
+     public static String version = "Unknown-Version";
+     static {
+-        InputStream stream = Bukkit.class.getClassLoader().getResourceAsStream("META-INF/maven/org.plazmamc.plazma/plazma-api/pom.properties");
++        InputStream stream = Bukkit.class.getClassLoader().getResourceAsStream("META-INF/maven/dev.supervertex/supervertex-api/pom.properties");
+         Properties properties = new Properties();
+ 
+         if (stream != null) {

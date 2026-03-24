@@ -50,6 +50,7 @@ subprojects {
         maven("https://oss.sonatype.org/content/groups/public/")
         maven("https://libraries.minecraft.net/")
         maven("https://jitpack.io")
+        maven("https://hub.spigotmc.org/nexus/content/groups/public/") // bungeecord-chat
     }
 }
 

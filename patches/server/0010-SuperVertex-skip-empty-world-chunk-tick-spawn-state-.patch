@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 07:45:58 +0900
+Subject: [PATCH] SuperVertex: skip empty world chunk tick + spawn state
+ optimization
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+## skip-empty-world-chunk-tick (デフォルト: true)
+ServerChunkCache.tickChunks() にプレイヤー不在ワールドの早期リターンを追加。
+プレイヤーがいないワールドではランダムブロックtick・モブスポーンが
+無意味なため、チャンクtickループ全体をスキップする。
+ネザー/エンドが空の場合に効果が大きい。
+scheduled blockTick/fluidTick は ServerLevel.tick() 内で引き続き実行される。
+
+## spawn state 事前評価
+NaturalSpawner.createState() をスポーンが実行されないtickでスキップする。
+mobSpawnThrottleTicks による間引きtickでも毎回全エンティティを
+イテレートしていた問題を修正。willSpawnThisTick フラグで事前判定し
+不要なステート構築をスキップ。
+
+## rct-serial-threshold (デフォルト: 4)
+RegionizedChunkTicker.buildRegions() に閾値チェックを追加。
+チャンク数が rctSerialThreshold 以下の場合は Union-Find を実行せず
+チャンク全体を単一リージョンとして返す。少人数サーバーや
+プレイヤー密集時の RCT オーバーヘッドを削減。
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index 3ad1a91afbf2aececa06722e6c2dbef58b1cdffb..3e5fb7659fbdb1da27272d268634be721cf41ef8 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -75,6 +75,10 @@ public final class RegionizedChunkTicker {
+         int size = chunks.size();
+         if (size == 0) return Collections.emptyList();
+         if (size == 1) return Collections.singletonList(chunks);
++        // SuperVertex - rct-serial-threshold: 小チャンク数は Union-Find オーバーヘッドを避け全体を1リージョンとして返す
++        if (size <= SuperVertexConfig.rctSerialThreshold) {
++            return Collections.singletonList(chunks);
++        }
+ 
+         // チャンク位置 → インデックスの高速マップ (fastutil Long2Int)
+         it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap posToIndex =
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 398d7fe82728dd3bb05f2c124f56ff3380c2e874..85342d3eafd49f64f06fb5119b90d7006ed01893 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -182,4 +182,35 @@ public class SuperVertexConfig {
+     private static void asyncPlayerSave() {
+         asyncPlayerSave = getBoolean("performance.async-player-save", asyncPlayerSave);
+     }
++
++    // =========================================================
++    // Performance: Skip Empty World Chunk Ticking
++    // =========================================================
++
++    /**
++     * プレイヤーがいないワールドのチャンクtick（ランダムブロックtick・モブスポーン）をスキップするかどうか。
++     * ネザー・エンドが空の場合に大きな効果がある。
++     * スケジュールされたブロックtickはServerLevel.tick()側で引き続き実行される。
++     * プラグインがNPC等でワールドを常時使用している場合はfalseを推奨。
++     */
++    public static boolean skipEmptyWorldChunkTick = true;
++
++    private static void skipEmptyWorldChunkTick() {
++        skipEmptyWorldChunkTick = getBoolean("performance.skip-empty-world-chunk-tick", skipEmptyWorldChunkTick);
++    }
++
++    // =========================================================
++    // Performance: RCT Serial Threshold
++    // =========================================================
++
++    /**
++     * RCT (Regionized Chunk Ticking) でbuildRegions()をスキップして逐次処理に切り替える
++     * チャンク数の閾値。この値以下のチャンク数ではUnion-Findのオーバーヘッドを避ける。
++     * デフォルト: 4 (4チャンク以下は逐次処理が高速)
++     */
++    public static int rctSerialThreshold = 4;
++
++    private static void rctSerialThreshold() {
++        rctSerialThreshold = getInt("performance.rct-serial-threshold", rctSerialThreshold);
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 697c1c52b1cedf52b1c12ed848ab02e973bab63a..1f99c749998fea7382d9de054aa8405d77b284ce 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -713,22 +713,36 @@ public class ServerChunkCache extends ChunkSource {
+             //gameprofilerfiller.push("naturalSpawnCount"); // Purpur
+             //this.level.timings.countNaturalMobs.startTiming(); // Paper - timings // Purpur
+             int l = this.distanceManager.getNaturalSpawnChunkCount();
++            // SuperVertex start - 事前にスポーン実行の有無を計算し、不要な createSpawnState をスキップする
++            // flag2（後で計算される）と同じ条件を先に評価する。
++            final boolean willSpawnThisTick =
++                this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING)
++                && !this.level.players().isEmpty()
++                && (dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks <= 1
++                    || (worlddata.getGameTime() % dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks) == 0);
++            // SuperVertex end - pre-compute spawn flag
+             // Paper start - per player mob spawning
+             NaturalSpawner.SpawnState spawnercreature_d; // moved down
+             if ((this.spawnFriendlies || this.spawnEnemies) && this.chunkMap.playerMobDistanceMap != null) { // don't count mobs when animals and monsters are disabled
+                 // Pufferfish start - moved down when async processing
+                 if (!gg.pufferfish.pufferfish.PufferfishConfig.enableAsyncMobSpawning) {
++                    // SuperVertex start - skip expensive createState when no spawning will happen this tick
++                    if (willSpawnThisTick) {
+                     // re-set mob counts
+                     for (ServerPlayer player : this.level.players) {
+                         Arrays.fill(player.mobCounts, 0);
+                     }
+                     lastSpawnState = NaturalSpawner.createState(l, this.level.getAllEntities(), this::getFullChunk, null, true);
++                    } // SuperVertex end
+                 }
+                 // Pufferfish end
+             } else {
+                 // Pufferfish start - this is only implemented for per-player mob spawning so this makes everything work if this setting is disabled.
++                // SuperVertex start - skip when no spawning will happen
++                if (willSpawnThisTick) {
+                 lastSpawnState = NaturalSpawner.createState(l, this.level.getAllEntities(), this::getFullChunk, this.chunkMap.playerMobDistanceMap == null ? new LocalMobCapCalculator(this.chunkMap) : null, false);
+                 _pufferfish_spawnCountsReady.set(true);
++                } // SuperVertex end
+                 // Pufferfish end
+             }
+             // Paper end
+@@ -768,6 +782,13 @@ public class ServerChunkCache extends ChunkSource {
+             }
+ 
+             int chunksTicked = 0; // Paper
++            // SuperVertex start - プレイヤー不在ワールドはチャンクtick全体をスキップ
++            // (blockTicks/fluidTicks は ServerLevel.tick() 内で引き続き実行される)
++            if (dev.supervertex.SuperVertexConfig.skipEmptyWorldChunkTick
++                    && this.level.players().isEmpty()) {
++                return;
++            }
++            // SuperVertex end - skip empty world chunk tick
+             // SuperVertex start - RCT: Phase 1 でスポーン/inhabitedTime を逐次処理しつつ tick 対象を収集する
+             final java.util.List<LevelChunk> rctChunksToTick =
+                 dev.supervertex.SuperVertexConfig.regionizedChunkTicking

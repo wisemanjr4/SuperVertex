@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 25 Feb 2026 14:17:29 +0900
+Subject: [PATCH] SuperVertex: per-tick permission cache
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+100+プラグイン・コマンド多用環境向けの最適化。
+
+CraftHumanEntity.hasPermission(String/Permission) に1tick間有効な
+キャッシュを追加。同一tickで同じパーミッションノードが繰り返しチェックされる際
+（コマンド実行時のガード、EventHandler内のチェック等）に
+LuckPerms/PermissibleBase のルックアップコストを削減する。
+
+安全性:
+- tickCountが変わるとキャッシュを自動クリア（1tick単位で新鮮なデータ）
+- recalculatePermissions() を呼ぶと即座にキャッシュを無効化
+  （プラグインがtick内でパーミッションを変更しても整合性が保たれる）
+- performance.permission-cache: false で無効化可能
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 85342d3eafd49f64f06fb5119b90d7006ed01893..0e364d6aeb6423a6a399ca32b138d293d5961e32 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -213,4 +213,22 @@ public class SuperVertexConfig {
+     private static void rctSerialThreshold() {
+         rctSerialThreshold = getInt("performance.rct-serial-threshold", rctSerialThreshold);
+     }
++
++    // =========================================================
++    // Performance: Per-tick Permission Cache
++    // =========================================================
++
++    /**
++     * プレイヤーのパーミッションチェック結果を1tick間キャッシュするかどうか。
++     * 同一tickに同じノードが何度もチェックされる場合（コマンド実行、イベント処理等）に
++     * LuckPerms/SuperPerms のルックアップコストを削減する。
++     * プラグインがtick内でパーミッションを変更する場合は recalculatePermissions() で
++     * 即座にキャッシュが無効化されるため安全。
++     * 多プラグイン・コマンド多用環境で効果が高い。
++     */
++    public static boolean permissionCache = true;
++
++    private static void permissionCache() {
++        permissionCache = getBoolean("performance.permission-cache", permissionCache);
++    }
+ }
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+index 468023414b4a9119a3418b8e8a5e38375bbd2407..30631ea9c0d300473546525588572e366ab58edd 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+@@ -74,6 +74,12 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+     protected final PermissibleBase perm = new PermissibleBase(this);
+     private boolean op;
+     private GameMode mode;
++    // SuperVertex start - per-tick permission cache
++    // 1tickに同一ノードが何度もチェックされる場合に PermissibleBase/LuckPerms の
++    // ルックアップを省略する。recalculatePermissions() で即座に無効化される。
++    private final java.util.HashMap<String, Boolean> sv_permCache = new java.util.HashMap<>();
++    private int sv_permCacheTick = -1;
++    // SuperVertex end - per-tick permission cache
+ 
+     public CraftHumanEntity(final CraftServer server, final Player entity) {
+         super(server, entity);
+@@ -230,11 +236,31 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+ 
+     @Override
+     public boolean hasPermission(String name) {
++        // SuperVertex start - per-tick permission cache
++        if (dev.supervertex.SuperVertexConfig.permissionCache) {
++            int tick = net.minecraft.server.MinecraftServer.currentTick;
++            if (tick != this.sv_permCacheTick) {
++                this.sv_permCache.clear();
++                this.sv_permCacheTick = tick;
++            }
++            return this.sv_permCache.computeIfAbsent(name, this.perm::hasPermission);
++        }
++        // SuperVertex end - per-tick permission cache
+         return this.perm.hasPermission(name);
+     }
+ 
+     @Override
+     public boolean hasPermission(Permission perm) {
++        // SuperVertex start - per-tick permission cache (Permission object → use name as key)
++        if (dev.supervertex.SuperVertexConfig.permissionCache) {
++            int tick = net.minecraft.server.MinecraftServer.currentTick;
++            if (tick != this.sv_permCacheTick) {
++                this.sv_permCache.clear();
++                this.sv_permCacheTick = tick;
++            }
++            return this.sv_permCache.computeIfAbsent(perm.getName(), k -> this.perm.hasPermission(perm));
++        }
++        // SuperVertex end - per-tick permission cache
+         return this.perm.hasPermission(perm);
+     }
+ 
+@@ -265,6 +291,7 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+ 
+     @Override
+     public void recalculatePermissions() {
++        this.sv_permCache.clear(); // SuperVertex - パーミッション変更時にキャッシュを即時無効化
+         this.perm.recalculatePermissions();
+         getHandle().canPortalInstant = hasPermission("purpur.portal.instant"); // Purpur
+     }

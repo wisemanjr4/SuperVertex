@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Tue, 24 Mar 2026 15:50:27 +0900
+Subject: [PATCH] =?UTF-8?q?SuperVertex:=20Fix=20=E9=9B=86=E5=9B=A3?=
+ =?UTF-8?q?=E4=B8=8B=E6=A0=A1=E3=83=90=E3=82=B0=20and=20version=20string?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ClientboundPlayerInfoUpdatePacket: Filter empty-name Floodgate
+  profile properties from ADD_PLAYER writer. ViaVersion fails to
+  translate PLAYER_INFO_UPDATE when Floodgate injects Property[name=""]
+  causing all 1.20.3+ clients to disconnect.
+- CraftServer.getVersion(): Strip literal quote chars from git hash
+  and remove (Plazma) suffix. Fixes MythicMobs version parse failure.
+
+diff --git a/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java b/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
+index 613661d6bdfe0aa9124469fe74f9d5bd44da088a..f6785e597773a9c0a6c6d4c10f94389e8e762ac1 100644
+--- a/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
++++ b/src/main/java/net/minecraft/network/protocol/game/ClientboundPlayerInfoUpdatePacket.java
+@@ -89,7 +89,15 @@ public class ClientboundPlayerInfoUpdatePacket implements Packet<ClientGamePacke
+             serialized.profile = gameProfile;
+         }, (buf, entry) -> {
+             buf.writeUtf(entry.profile().getName(), 16);
+-            buf.writeGameProfileProperties(entry.profile().getProperties());
++            // SuperVertex start - 集団下校バグ修正: Floodgateが注入する空nameプロパティを除去
++            // Floodgateはname=""・value=""・signature=JSON文字列のプロパティをGameProfileに注入する。
++            // ViaVersionがこれを1.20.3+プロトコルへ変換する際に失敗し、全クライアントが切断される。
++            com.mojang.authlib.properties.PropertyMap safeProps = new com.mojang.authlib.properties.PropertyMap();
++            entry.profile().getProperties().entries().stream()
++                .filter(e -> e.getKey() != null && !e.getKey().isEmpty())
++                .forEach(e -> safeProps.put(e.getKey(), e.getValue()));
++            buf.writeGameProfileProperties(safeProps);
++            // SuperVertex end
+         }),
+         INITIALIZE_CHAT((serialized, buf) -> {
+             serialized.chatSession = buf.readNullable(RemoteChatSession.Data::read);
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index a0ad2a0e79056535e382a234586142eeb4dd9210..1c638c4b18586964d0b3dbb54b5983ee53ecd4f3 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -587,7 +587,7 @@ public final class CraftServer implements Server {
+ 
+     @Override
+     public String getVersion() {
+-        return this.serverVersion + " (Plazma) (MC: " + this.console.getServerVersion() + ")"; // SuperVertex - plugin compat: include known upstream names
++        return this.serverVersion.replace("\"", "") + " (MC: " + this.console.getServerVersion() + ")"; // SuperVertex - plugin compat: 引用符除去 + 標準 Paper フォーマット
+     }
+ 
+     @Override
