@@ -38,6 +38,7 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 | Skip Empty World Tick | プレイヤー不在ワールドの chunk tick を完全スキップ |
 | Per-Tick Permission Cache | 同一 tick 内のパーミッション判定をキャッシュして LuckPerms 負荷を削減 |
 | Entity Tracker Buffer Reuse | `processTrackQueue` の `ArrayList` を再利用バッファ化して GC 削減 |
+| Entity Deep Sleep | 長時間非アクティブエンティティの `inactiveTick()` 自体を 4 tick に 1 回に削減。EAR/DAB がゴールセレクターを間引くのに対し、fire tick・移動・属性更新等のエントリコストも削減 |
 | Attribute Map CME Fix | `dirtyAttributes` を `ConcurrentHashMap.KeySet` に変更し、非同期プラグイン起因の CME を防止 |
 | broadcastChanges Null Guard | RCT 環境下での non-full chunk への NPE をガード |
 
@@ -88,6 +89,16 @@ performance:
 
   # dynamic-random-tick-speed: 遠方チャンクに適用する速度の最小係数 (0.0〜1.0)
   dynamic-random-tick-speed-min-factor: 0.25
+
+  # 長時間非アクティブなエンティティの inactiveTick() 自体をスロットルするか
+  # Spigot EAR / Pufferfish DAB に追加で機能し、RPG サーバーで特に効果的
+  entity-deep-sleep: true
+
+  # Deep Sleep に入るまでの連続非アクティブ tick 数 (デフォルト: 100 = 5秒)
+  entity-deep-sleep-min-inactive-ticks: 100
+
+  # Deep Sleep 中のエンティティが inactiveTick() を呼ぶ間隔 (デフォルト: 4 tick に 1 回)
+  entity-deep-sleep-tick-rate: 4
 ```
 
 ---
@@ -154,6 +165,7 @@ git push origin main
 | 0021 | RCT: 未対応 unsafe ブロック追加・Block Safety Cache 最適化 |
 | 0022 | RCT: リージョン負荷分散・per-tick アロケーション削減 |
 | 0023 | Dynamic Random Tick Speed・Entity Tracker バッファ再利用・Mob Spawn Throttle 完全化 |
+| 0024 | Entity Deep Sleep（長時間非アクティブエンティティの `inactiveTick()` スロットル） |
 
 ---
 
