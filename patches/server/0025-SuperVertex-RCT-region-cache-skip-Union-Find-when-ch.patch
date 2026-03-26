@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Thu, 26 Mar 2026 13:17:12 +0900
+Subject: [PATCH] SuperVertex: RCT region cache - skip Union-Find when chunk
+ set unchanged
+
+buildRegions() was recomputing Union-Find every tick even when no players moved.
+Added O(N) XOR fingerprint check; if chunk set is identical to previous tick,
+return cached regions directly. Cache is invalidated on any chunk set change
+(player movement, login/logout, chunk load/unload).
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index 9cd775c02108270699ae50a73ae081bf564cc6ef..dc8e549f7ff52db3aa3c89481947f743a48355a7 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -76,8 +76,27 @@ public final class RegionizedChunkTicker {
+     private static final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<List<LevelChunk>> reuseRegionMap =
+             new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+ 
++    // =========================================================
++    // リージョンキャッシュ — チャンクセットが変わらない限り Union-Find を再計算しない
++    // =========================================================
++    // プレイヤーが動いていなければ tick 対象チャンクセットは毎 tick 同じ。
++    // フィンガープリント（サイズ + 全 ChunkPos XOR）が前 tick と一致したらキャッシュを返す。
++    private static long   cachedFingerprint = Long.MIN_VALUE;
++    private static List<List<LevelChunk>> cachedRegions = null;
++
++    /** チャンクリストのフィンガープリントを O(N) で計算する。順序不変の XOR ベース。 */
++    private static long computeFingerprint(List<LevelChunk> chunks, int size) {
++        long fp = size;
++        for (int i = 0; i < size; i++) {
++            // ChunkPos.toLong() は (x << 32 | z) 形式の一意な long
++            fp ^= Long.rotateLeft(chunks.get(i).getPos().toLong(), i & 63);
++        }
++        return fp;
++    }
++
+     /**
+      * 与えられたチャンクリストを「隣接チャンクを同一グループ」にまとめる Union-Find でリージョンに分割する。
++     * チャンクセットが前 tick から変わっていない場合はキャッシュを返し Union-Find をスキップする。
+      * 返却リストの各要素が 1 リージョンのチャンク一覧。
+      */
+     public static List<List<LevelChunk>> buildRegions(List<LevelChunk> chunks) {
+@@ -89,6 +108,13 @@ public final class RegionizedChunkTicker {
+             return Collections.singletonList(chunks);
+         }
+ 
++        // SuperVertex - リージョンキャッシュ: チャンクセットが前 tick と同じなら Union-Find をスキップ
++        // プレイヤーが移動しない限りチャンクセットは変わらない。O(N) の XOR フィンガープリントで判定。
++        final long fp = computeFingerprint(chunks, size);
++        if (fp == cachedFingerprint && cachedRegions != null) {
++            return cachedRegions;
++        }
++
+         // チャンク位置 → インデックスの高速マップ（再利用バッファ）
+         reusePosIdx.clear();
+         reusePosIdx.defaultReturnValue(-1);
+@@ -163,8 +189,13 @@ public final class RegionizedChunkTicker {
+ 
+         if (workerRegions.size() == 1) {
+             // ワーカーゼロ → 逐次実行
++            cachedFingerprint = fp;
++            cachedRegions = workerRegions;
+             return workerRegions;
+         }
++        // キャッシュ更新してから返す
++        cachedFingerprint = fp;
++        cachedRegions = workerRegions;
+         return workerRegions;
+     }
+ 
