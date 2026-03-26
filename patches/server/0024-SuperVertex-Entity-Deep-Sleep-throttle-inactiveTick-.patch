@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Thu, 26 Mar 2026 13:10:42 +0900
+Subject: [PATCH] SuperVertex: Entity Deep Sleep - throttle inactiveTick for
+ long-inactive entities
+
+Spigot EAR deactivates far entities; Pufferfish DAB throttles their AI goal selector rate.
+Deep Sleep goes further: throttles the inactiveTick() call itself, reducing fire ticking,
+movement, attribute updates, etc. for entities inactive for >= 100 ticks (configurable).
+
+Entities are staggered by ID so load is evenly distributed across ticks.
+Entities in combat (activatedImmunityTick) are exempt from deep sleep.
+
+Config: entity-deep-sleep, entity-deep-sleep-min-inactive-ticks, entity-deep-sleep-tick-rate
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 7fab8222d83784f42939309f1c059e35c5c9b423..10f8ad77934d1f8ff96e765c6f61f39117a8c2d9 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -296,6 +296,47 @@ public class SuperVertexConfig {
+         if (dynamicRandomTickSpeedMinFactor > 1.0) dynamicRandomTickSpeedMinFactor = 1.0;
+     }
+ 
++    // =========================================================
++    // Performance: Entity Deep Sleep
++    // =========================================================
++
++    /**
++     * 長時間非アクティブなエンティティの inactiveTick() 自体をスロットルする。
++     * Spigot EAR・Pufferfish DAB がゴールセレクター頻度を下げるのに対し、
++     * Deep Sleep は fire tick・移動・属性更新等のエントリコストも削減する。
++     * プレイヤー不在エリアに大量 MythicMobs が存在する RPG サーバーで特に効果的。
++     */
++    public static boolean entityDeepSleep = true;
++
++    private static void entityDeepSleep() {
++        entityDeepSleep = getBoolean("performance.entity-deep-sleep", entityDeepSleep);
++    }
++
++    /**
++     * Deep Sleep に入るまでの連続非アクティブ tick 数。
++     * この tick 数の間は通常の inactiveTick() を呼び続け、以降は tick-rate 間隔に削減。
++     * デフォルト: 100 (5秒)
++     */
++    public static int entityDeepSleepMinInactiveTicks = 100;
++
++    private static void entityDeepSleepMinInactiveTicks() {
++        entityDeepSleepMinInactiveTicks = getInt("performance.entity-deep-sleep-min-inactive-ticks", entityDeepSleepMinInactiveTicks);
++        if (entityDeepSleepMinInactiveTicks < 1) entityDeepSleepMinInactiveTicks = 1;
++    }
++
++    /**
++     * Deep Sleep 中のエンティティが inactiveTick() を呼ぶ tick 間隔。
++     * 例: 4 = 4 tick に 1 回処理（75% 削減）。
++     * エンティティ ID でスタガリングするため負荷は各 tick に均等分散される。
++     * デフォルト: 4
++     */
++    public static int entityDeepSleepTickRate = 4;
++
++    private static void entityDeepSleepTickRate() {
++        entityDeepSleepTickRate = getInt("performance.entity-deep-sleep-tick-rate", entityDeepSleepTickRate);
++        if (entityDeepSleepTickRate < 1) entityDeepSleepTickRate = 1;
++    }
++
+     // =========================================================
+     // 設定の再読み込み
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index a684bb62e478386b7540c901f928963a9ab3c266..5fe57dade85441eb9b82122edee7d22537273d80 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -1442,7 +1442,23 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             TimingHistory.activatedEntityTicks++;
+         entity.tick();
+         entity.postTick(); // CraftBukkit
+-        } else { entity.inactiveTick(); } // Paper - EAR 2
++        } else { // Paper - EAR 2
++            // SuperVertex start - Entity Deep Sleep
++            // Spigot EAR deactivates far entities; Pufferfish DAB throttles their AI goal rate.
++            // Deep Sleep goes further: throttles the inactiveTick() call itself (fire, move, attributes, etc.)
++            // for entities that have been continuously inactive for entityDeepSleepMinInactiveTicks ticks.
++            // Staggered by entity ID so N entities are spread evenly across N ticks (no tick spikes).
++            // Exempt: entities with active immunity (in combat, recently targeted, etc.)
++            final long _inactiveDuration = net.minecraft.server.MinecraftServer.currentTick - entity.activatedTick;
++            if (!dev.supervertex.SuperVertexConfig.entityDeepSleep
++                    || entity.activatedImmunityTick >= net.minecraft.server.MinecraftServer.currentTick
++                    || _inactiveDuration < dev.supervertex.SuperVertexConfig.entityDeepSleepMinInactiveTicks
++                    || (net.minecraft.server.MinecraftServer.currentTick % dev.supervertex.SuperVertexConfig.entityDeepSleepTickRate)
++                       == (Math.abs(entity.getId()) % dev.supervertex.SuperVertexConfig.entityDeepSleepTickRate)) {
++                entity.inactiveTick();
++            }
++            // SuperVertex end - Entity Deep Sleep
++        }
+         //this.getProfiler().pop(); // Purpur
+         //} finally { timer.stopTiming(); } // Paper - timings // Purpur
+         Iterator iterator = entity.getPassengers().iterator();
