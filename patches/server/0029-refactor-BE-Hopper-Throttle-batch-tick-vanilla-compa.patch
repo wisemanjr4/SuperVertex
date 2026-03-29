@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Mon, 30 Mar 2026 01:43:42 +0900
+Subject: [PATCH] refactor: BE/Hopper Throttle -> batch tick
+ (vanilla-compatible)
+
+Instead of skipping ticks (which slows smelting/hopper speed),
+run tickRate iterations in a single tick on the 'duty' tick and
+skip the rest. Total work per tickRate real-ticks is identical to
+vanilla, so furnace smelt time, hopper transfer rate, brewing
+duration are all unchanged.
+
+Hopper correctness: cooldown decrements each sub-tick, so batching
+N calls still consumes N cooldown ticks -> same transfer rate.
+Only main-thread loop overhead is reduced (tickRate-1 skipped
+iterations per tickRate ticks).
+
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index 752e69ad6d7e51928f614f61ba1b0b07ccfa12ac..0b3995d918345d272340b191950987a202caf54a 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -1030,20 +1030,31 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+     private int   beThrottlePlayerCount   = 0;
+ 
+     /**
+-     * Block Entity の種別ごとのスロットル判定。
+-     * 遠方かつ今 tick にスロットル対象なら true を返す（= tick をスキップ）。
++     * Block Entity のバッチ tick 数を返す。
+      *
+-     * スロットル対象 BE:
++     * 戻り値の意味:
++     *   1          = 通常通り 1 回 tick（プレイヤー近傍 or 対象外 BE）
++     *   tickRate   = バッチ tick（遠方 BE の当番 tick: tickRate 回まとめて実行）
++     *   0          = 今 tick はスキップ（遠方 BE の非当番 tick）
++     *
++     * バッチ tick の利点:
++     *   溶鉱炉・醸造台・ホッパー等のロジックは線形（毎 tick 固定量加算/減算）なので、
++     *   N tick 分をまとめて実行しても N 回個別実行と結果が同一になる。
++     *   例: ホッパーは cooldown を毎 sub-tick で普通に減算するため、
++     *       バッチ実行でも合計 8 real-tick で 1 アイテム転送 = バニラ完全互換。
++     *   → ゲーム挙動を変えずにループオーバーヘッドだけを削減できる。
++     *
++     * 対象 BE:
+      *   furnace / blast_furnace / smoker / brewing_stand / campfire / soul_campfire
+      *   → blockEntityThrottle 設定で制御
+-     *   hopper → hopperThrottle 設定で制御（保守的なレート）
++     *   hopper → hopperThrottle 設定で制御（保守的なデフォルト tickRate=2）
+      */
+-    private boolean shouldThrottleBlockEntity(TickingBlockEntity tbe) {
++    private int getBlockEntityTickBatch(TickingBlockEntity tbe) {
+         final String type = tbe.getType();
+         final boolean isHopper = "minecraft:hopper".equals(type);
+         final boolean isSafeBe;
+         if (isHopper) {
+-            if (!dev.supervertex.SuperVertexConfig.hopperThrottle) return false;
++            if (!dev.supervertex.SuperVertexConfig.hopperThrottle) return 1;
+             isSafeBe = true;
+         } else if (dev.supervertex.SuperVertexConfig.blockEntityThrottle) {
+             isSafeBe = "minecraft:furnace".equals(type)
+@@ -1053,11 +1064,11 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+                     || "minecraft:campfire".equals(type)
+                     || "minecraft:soul_campfire".equals(type);
+         } else {
+-            return false;
++            return 1;
+         }
+-        if (!isSafeBe) return false;
++        if (!isSafeBe) return 1;
+ 
+-        // プレイヤー近接チェック
++        // プレイヤー近接チェック: 近傍なら通常 tick
+         final int nearChunks = isHopper
+                 ? dev.supervertex.SuperVertexConfig.hopperThrottleNearChunks
+                 : dev.supervertex.SuperVertexConfig.blockEntityThrottleNearChunks;
+@@ -1067,15 +1078,18 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         for (int i = 0; i < beThrottlePlayerCount; i++) {
+             final int dx = Math.abs(beThrottlePlayerChunkXZ[i * 2]     - chunkX);
+             final int dz = Math.abs(beThrottlePlayerChunkXZ[i * 2 + 1] - chunkZ);
+-            if (Math.max(dx, dz) <= nearChunks) return false; // 近くにプレイヤーがいる → スキップしない
++            if (Math.max(dx, dz) <= nearChunks) return 1; // 近くにプレイヤーがいる → 通常 tick
+         }
+ 
+-        // 遠方 — 座標ハッシュでスタガリングして負荷を各 tick に均等分散
++        // 遠方 — 座標ハッシュで当番 tick を決定してスタガリング
+         final int tickRate = isHopper
+                 ? dev.supervertex.SuperVertexConfig.hopperThrottleTickRate
+                 : dev.supervertex.SuperVertexConfig.blockEntityThrottleTickRate;
+         final long currentTick = net.minecraft.server.MinecraftServer.currentTick;
+-        return (currentTick % tickRate) != (Math.abs(pos.hashCode()) % tickRate);
++        if ((currentTick % tickRate) == (Math.abs(pos.hashCode()) % tickRate)) {
++            return tickRate; // 当番 tick: tickRate 回分まとめて実行
++        }
++        return 0; // 非当番 tick: スキップ
+     }
+     // SuperVertex end - Block Entity Throttle / Hopper Throttle
+ 
+@@ -1130,10 +1144,14 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+                 toRemove.add(tickingblockentity); // Paper - use removeAll
+                 // Spigot end
+             } else if (this.shouldTickBlocksAt(tickingblockentity.getPos())) {
+-                // SuperVertex start - BE/Hopper Throttle: 遠方 BE の tick を間引く
+-                if (!shouldThrottleBlockEntity(tickingblockentity)) {
+-                tickingblockentity.tick();
+-                } // SuperVertex end
++                // SuperVertex start - BE/Hopper Throttle: バッチ tick
++                // 遠方 BE は tickRate 回分まとめて実行（当番 tick のみ）、挙動はバニラ完全互換。
++                // 近傍 BE は batchCount=1 で通常通り実行。
++                final int _batchCount = getBlockEntityTickBatch(tickingblockentity);
++                for (int _b = 0; _b < _batchCount; _b++) {
++                    tickingblockentity.tick();
++                }
++                // SuperVertex end
+                 // Paper start - execute chunk tasks during tick
+                 if ((this.tileTickPosition & 7) == 0) {
+                     MinecraftServer.getServer().executeMidTickTasks();

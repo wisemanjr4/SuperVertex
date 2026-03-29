@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Sun, 29 Mar 2026 19:32:56 +0900
+Subject: [PATCH] feat: cache computeAdjustedRandomTickSpeed results per player
+ position snapshot
+
+Pure function (chunkX, chunkZ, baseK, playerPositions) -> same result.
+Add Long2IntOpenHashMap cache with XOR fingerprint of player chunk coords.
+Invalidate when players move or baseK changes; eager precompute for all
+RCT chunks on main thread before tickRegionsParallel so workers are
+read-only (no cache write contention). Non-RCT path uses lazy caching.
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index d9c680f9aaad9e57958c4bce20295da883ca9dab..def300e76c54349b4b3b2d0660bfb9a101253a68 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -83,6 +83,13 @@ public class ServerChunkCache extends ChunkSource {
+     // Written by main thread before chunk loop; read-only during RCT workers (safe via ForkJoinPool happens-before).
+     private int[] playerChunkXZCache = new int[0];
+     private int playerChunkXZCacheSize = 0; // number of valid entries (pairs)
++    // SuperVertex - adjustedSpeed cache: プレイヤー位置と baseK が同じなら全チャンクの速度は同じ結果になる。
++    // メインスレッドがプリコンピュートし、RCT ワーカーは読み取りのみ（競合なし）。
++    private long _playerPosCacheFingerprint = Long.MIN_VALUE;
++    private int  _playerPosCacheBaseK = -1;
++    private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap _adjustedSpeedCache =
++            new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(256, 0.5f);
++    { _adjustedSpeedCache.defaultReturnValue(-1); }
+ 
+     public boolean firstRunSpawnCounts = true; // Pufferfish
+     public final java.util.concurrent.atomic.AtomicBoolean _pufferfish_spawnCountsReady = new java.util.concurrent.atomic.AtomicBoolean(false); // Pufferfish - optimize countmobs
+@@ -740,6 +747,17 @@ public class ServerChunkCache extends ChunkSource {
+                     playerChunkXZCache[_i * 2]     = net.minecraft.core.SectionPos.blockToSectionCoord((int) _p.getX());
+                     playerChunkXZCache[_i * 2 + 1] = net.minecraft.core.SectionPos.blockToSectionCoord((int) _p.getZ());
+                 }
++                // SuperVertex - speed cache invalidation: プレイヤー位置が変化したらキャッシュを無効化する。
++                // 位置が同じなら全チャンクの computeAdjustedRandomTickSpeed 結果は同一のため再利用できる。
++                long _newPosFP = playerChunkXZCacheSize;
++                for (int _i = 0; _i < playerChunkXZCacheSize * 2; _i++) {
++                    _newPosFP = Long.rotateLeft(_newPosFP, 17) ^ playerChunkXZCache[_i];
++                }
++                if (_newPosFP != _playerPosCacheFingerprint) {
++                    _playerPosCacheFingerprint = _newPosFP;
++                    _playerPosCacheBaseK = -1; // baseK も再チェックを強制
++                    _adjustedSpeedCache.clear();
++                }
+             }
+             // SuperVertex end - dynamic randomTickSpeed snapshot
+             // Paper start - per player mob spawning
+@@ -878,12 +896,24 @@ public class ServerChunkCache extends ChunkSource {
+             // Phase1 で天候・氷雪は処理済みのため、Section C（randomTick）のみ並列実行する
+             if (rctChunksToTick != null && !rctChunksToTick.isEmpty()) {
+                 final int randomTickSpeed = k; // effectively final for lambda
++                // SuperVertex - speed cache: baseK 変化で invalidate。
++                // RCT ワーカー起動前に全チャンク分をメインスレッドでイーガープリコンピュート。
++                // ワーカーはキャッシュ済み値を読み取るだけ（書き込みなし → 競合なし）。
++                if (dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeed && randomTickSpeed > 0) {
++                    if (randomTickSpeed != _playerPosCacheBaseK) {
++                        _playerPosCacheBaseK = randomTickSpeed;
++                        _adjustedSpeedCache.clear();
++                    }
++                    for (LevelChunk _c : rctChunksToTick) {
++                        computeAdjustedRandomTickSpeed(_c.getPos().x, _c.getPos().z, randomTickSpeed);
++                    }
++                }
+                 java.util.List<java.util.List<LevelChunk>> regions =
+                     dev.supervertex.RegionizedChunkTicker.buildRegions(rctChunksToTick);
+                 dev.supervertex.RegionizedChunkTicker.tickRegionsParallel(regions,
+                     chunk -> this.level.tickChunkRandomOnly(
+                         chunk,
+-                        // SuperVertex - dynamic randomTickSpeed: per-chunk adjusted k (reads playerChunkXZCache snapshot)
++                        // SuperVertex - dynamic randomTickSpeed: per-chunk adjusted k (cache hit guaranteed)
+                         computeAdjustedRandomTickSpeed(chunk.getPos().x, chunk.getPos().z, randomTickSpeed)));
+                 net.minecraft.server.MinecraftServer.getServer().executeMidTickTasks();
+             }
+@@ -1101,19 +1131,29 @@ public class ServerChunkCache extends ChunkSource {
+     }
+ 
+     // SuperVertex start - dynamic randomTickSpeed: compute distance-adjusted k for a chunk
+-    // Called from both RCT workers (thread-safe: reads immutable playerChunkXZCache snapshot) and main thread.
++    // RCT パス: ワーカー起動前にメインスレッドがイーガープリコンピュートするためキャッシュ必ずヒット。
++    // 非 RCT パス: シングルスレッドのため遅延キャッシュで問題なし。
++    // プレイヤー位置と baseK が変化しない限り全チャンクの結果は同じなのでキャッシュを再利用する。
+     private int computeAdjustedRandomTickSpeed(int chunkX, int chunkZ, int baseK) {
+         if (!dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeed || baseK <= 0) return baseK;
++        long key = net.minecraft.world.level.ChunkPos.asLong(chunkX, chunkZ);
++        int cached = _adjustedSpeedCache.get(key); // default -1 (未キャッシュ)
++        if (cached >= 0) return cached;
++        // キャッシュミス: 計算してキャッシュに保存
+         final int nearChunks = dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeedNearChunks;
+         final int n = playerChunkXZCacheSize;
+         for (int i = 0; i < n; i++) {
+             int dx = Math.abs(playerChunkXZCache[i * 2]     - chunkX);
+             int dz = Math.abs(playerChunkXZCache[i * 2 + 1] - chunkZ);
+-            if (Math.max(dx, dz) <= nearChunks) return baseK; // within near radius → full speed
++            if (Math.max(dx, dz) <= nearChunks) {
++                _adjustedSpeedCache.put(key, baseK);
++                return baseK; // within near radius → full speed
++            }
+         }
+         // Far from all players — reduce to min factor
+-        int reduced = (int) (baseK * dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeedMinFactor + 0.5);
+-        return Math.max(0, reduced);
++        int reduced = Math.max(0, (int) (baseK * dev.supervertex.SuperVertexConfig.dynamicRandomTickSpeedMinFactor + 0.5));
++        _adjustedSpeedCache.put(key, reduced);
++        return reduced;
+     }
+     // SuperVertex end - dynamic randomTickSpeed
+ 

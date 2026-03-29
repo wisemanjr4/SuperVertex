@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Mon, 30 Mar 2026 02:10:39 +0900
+Subject: [PATCH] feat: tick phase coordination - eliminate cross-process tick
+ spikes
+
+Add SuperVertexTickScheduler with per-process phase offsets (0-3).
+All periodic processes now use isActiveTick(hash, phaseOffset, period, tick)
+so they don't coincide on the same tick:
+
+  PHASE_MOB_SPAWN=0   Mob spawn (per-chunk distributed)
+  PHASE_CHUNK_TICK=1  Chunk tick spread
+  PHASE_BE_THROTTLE=2 Block entity batch tick
+  PHASE_DEEP_SLEEP=3  Entity deep sleep
+
+Key change: mob spawnForChunk converted from global (all chunks on one tick)
+to per-chunk scheduling via isActiveTick. createState still refreshes every
+throttle ticks; spawnForChunk distributes across ticks using chunk hash.
+Eliminates the concentrated spawn spike that caused 143ms max MSPT.
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexTickScheduler.java b/src/main/java/dev/supervertex/SuperVertexTickScheduler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d38054b491eacd39e5bb39a219e90d02458e6c37
+--- /dev/null
++++ b/src/main/java/dev/supervertex/SuperVertexTickScheduler.java
+@@ -0,0 +1,59 @@
++package dev.supervertex;
++
++/**
++ * SuperVertex Tick Phase Scheduler
++ *
++ * 異なる周期処理に互いに異なる位相オフセットを割り当て、
++ * 複数処理が同一 tick に集中してスパイクを起こすのを防ぐ。
++ *
++ * 例: 全処理が period=4 の場合、オフセット 0〜3 を割り当てると
++ *     各 tick に 1 処理ずつ均等に分散する。
++ *
++ *   tick % 4 == 0  →  Mob Spawn (PHASE_MOB_SPAWN=0)
++ *   tick % 4 == 1  →  Chunk Tick Spread (PHASE_CHUNK_TICK=1)
++ *   tick % 4 == 2  →  BE Batch (PHASE_BE_THROTTLE=2)
++ *   tick % 4 == 3  →  Entity Deep Sleep (PHASE_DEEP_SLEEP=3)
++ */
++public final class SuperVertexTickScheduler {
++
++    private SuperVertexTickScheduler() {}
++
++    // =========================================================
++    // 各処理の位相オフセット定数
++    // =========================================================
++
++    /** Mob Spawn per-chunk 分散の位相オフセット */
++    public static final int PHASE_MOB_SPAWN   = 0;
++
++    /** Chunk Tick Spread の位相オフセット */
++    public static final int PHASE_CHUNK_TICK  = 1;
++
++    /** Block Entity Batch Tick の位相オフセット */
++    public static final int PHASE_BE_THROTTLE = 2;
++
++    /** Entity Deep Sleep の位相オフセット */
++    public static final int PHASE_DEEP_SLEEP  = 3;
++
++    // =========================================================
++    // 判定ヘルパー
++    // =========================================================
++
++    /**
++     * 要素固有のハッシュ値と位相オフセットを使って、今 tick がこの要素の当番かを判定する。
++     *
++     * 計算式: (currentTick % period) == ((|hash| + phaseOffset) % period)
++     *
++     * 同じ period を持つ複数の処理に異なる phaseOffset を設定することで、
++     * 処理が同一 tick に集中しなくなる。
++     *
++     * @param hash        要素固有ハッシュ（entity ID, pos.hashCode(), chunk hash 等）
++     * @param phaseOffset プロセスの位相オフセット（PHASE_* 定数を使用）
++     * @param period      周期（tick 数）。1 以下なら常に true
++     * @param currentTick 現在の tick カウント
++     * @return true = 今 tick がこの要素の当番
++     */
++    public static boolean isActiveTick(int hash, int phaseOffset, int period, long currentTick) {
++        if (period <= 1) return true;
++        return (currentTick % period) == ((Math.abs(hash) + phaseOffset) % period);
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index def300e76c54349b4b3b2d0660bfb9a101253a68..6732e955cbe7ed35d9de3219b1076f6b2a5cf0f0 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -796,13 +796,8 @@ public class ServerChunkCache extends ChunkSource {
+ 
+             //gameprofilerfiller.popPush("spawnAndTick"); // Purpur
+             boolean flag2 = this.level.getGameRules().getBoolean(GameRules.RULE_DOMOBSPAWNING) && !this.level.players().isEmpty(); // CraftBukkit
+-            // SuperVertex start - mob spawn throttling
+-            // mobSpawnThrottleTicks > 1 のとき、ゲーム時間が指定 tick の倍数の時のみスポーンを実行する。
+-            // これによりメインスレッドのスポーン処理負荷を分散させる。
+-            if (flag2 && dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks > 1) {
+-                flag2 = (worlddata.getGameTime() % dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks) == 0;
+-            }
+-            // SuperVertex end - mob spawn throttling
++            // SuperVertex - mob spawn throttle: flag2 はそのまま維持。
++            // spawnForChunk は下のループ内で per-chunk 分散スケジューリングで制御する。
+ 
+             // Paper - only shuffle if per-player mob spawning is disabled
+             // Paper - moved natural spawn event up
+@@ -849,10 +844,19 @@ public class ServerChunkCache extends ChunkSource {
+ 
+                 if ((true || this.level.isNaturalSpawningAllowed(chunkcoordintpair)) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, false)) { // Paper - optimise anyPlayerCloseEnoughForSpawning // Paper - the chunk is known ticking
+                     chunk1.incrementInhabitedTime(j);
+-                    // SuperVertex start - mob spawn throttle: skip spawnForChunk on non-spawn ticks
+-                    // willSpawnThisTick already gates createState; also gate spawnForChunk to avoid
+-                    // iterating spawn candidates on ticks where lastSpawnState was not refreshed.
+-                    if (willSpawnThisTick && flag2 && (!gg.pufferfish.pufferfish.PufferfishConfig.enableAsyncMobSpawning || _pufferfish_spawnCountsReady.get()) && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, true)) { // Spigot // Paper - optimise anyPlayerCloseEnoughForSpawning & optimise chunk tick iteration
++                    // SuperVertex start - mob spawn per-chunk 分散スケジューリング
++                    // createState は willSpawnThisTick (throttle 周期) でのみ更新。
++                    // spawnForChunk はチャンクハッシュで分散: throttle 周期内の異なる tick に各チャンクを割り当てる。
++                    // → 全チャンクが同一 tick に集中しなくなりスパイクを排除。lastSpawnState は数 tick 程度なら許容範囲。
++                    final boolean _spawnThisChunk = flag2
++                        && lastSpawnState != null
++                        && dev.supervertex.SuperVertexTickScheduler.isActiveTick(
++                               (int) chunkcoordintpair.toLong(),
++                               dev.supervertex.SuperVertexTickScheduler.PHASE_MOB_SPAWN,
++                               dev.supervertex.SuperVertexConfig.mobSpawnThrottleTicks,
++                               worlddata.getGameTime())
++                        && (!gg.pufferfish.pufferfish.PufferfishConfig.enableAsyncMobSpawning || _pufferfish_spawnCountsReady.get());
++                    if (_spawnThisChunk && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkcoordintpair) && this.chunkMap.anyPlayerCloseEnoughForSpawning(holder, chunkcoordintpair, true)) { // Spigot // Paper
+                         NaturalSpawner.spawnForChunk(this.level, chunk1, lastSpawnState, this.spawnFriendlies, this.spawnEnemies, flag1); // Pufferfish
+                     }
+                     // SuperVertex end
+@@ -862,9 +866,12 @@ public class ServerChunkCache extends ChunkSource {
+                         // chunkTickSpreadFactor == 1 の場合はバニラ動作（毎 tick 全チャンク）。
+                         // > 1 の場合はチャンク座標のハッシュを使ってサブセットを選択し負荷を分散させる。
+                         final int spreadFactor = dev.supervertex.SuperVertexConfig.chunkTickSpreadFactor;
+-                        final boolean shouldTick = spreadFactor <= 1
+-                            || (Math.abs(chunkcoordintpair.x * 1664525 + chunkcoordintpair.z * 1013904223) % spreadFactor)
+-                                == (worlddata.getGameTime() % spreadFactor);
++                        // SuperVertex - PHASE_CHUNK_TICK オフセットで他の周期処理との tick 集中を防ぐ
++                        final boolean shouldTick = dev.supervertex.SuperVertexTickScheduler.isActiveTick(
++                                chunkcoordintpair.x * 1664525 + chunkcoordintpair.z * 1013904223,
++                                dev.supervertex.SuperVertexTickScheduler.PHASE_CHUNK_TICK,
++                                spreadFactor,
++                                worlddata.getGameTime());
+                         if (shouldTick) {
+                             if (rctChunksToTick != null) {
+                                 // RCT Phase1: Section A（雷）・Section B（氷雪）をメインスレッドで先行実行
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 5fe57dade85441eb9b82122edee7d22537273d80..fdcffb94bffbfbc5330254ab400ad56c33bc24f0 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -1453,8 +1453,11 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             if (!dev.supervertex.SuperVertexConfig.entityDeepSleep
+                     || entity.activatedImmunityTick >= net.minecraft.server.MinecraftServer.currentTick
+                     || _inactiveDuration < dev.supervertex.SuperVertexConfig.entityDeepSleepMinInactiveTicks
+-                    || (net.minecraft.server.MinecraftServer.currentTick % dev.supervertex.SuperVertexConfig.entityDeepSleepTickRate)
+-                       == (Math.abs(entity.getId()) % dev.supervertex.SuperVertexConfig.entityDeepSleepTickRate)) {
++                    || dev.supervertex.SuperVertexTickScheduler.isActiveTick(
++                           entity.getId(),
++                           dev.supervertex.SuperVertexTickScheduler.PHASE_DEEP_SLEEP,
++                           dev.supervertex.SuperVertexConfig.entityDeepSleepTickRate,
++                           net.minecraft.server.MinecraftServer.currentTick)) {
+                 entity.inactiveTick();
+             }
+             // SuperVertex end - Entity Deep Sleep
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index 0b3995d918345d272340b191950987a202caf54a..599be1b905c3fc2e4de412df01f5273e2395df25 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -1086,7 +1086,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+                 ? dev.supervertex.SuperVertexConfig.hopperThrottleTickRate
+                 : dev.supervertex.SuperVertexConfig.blockEntityThrottleTickRate;
+         final long currentTick = net.minecraft.server.MinecraftServer.currentTick;
+-        if ((currentTick % tickRate) == (Math.abs(pos.hashCode()) % tickRate)) {
++        if (dev.supervertex.SuperVertexTickScheduler.isActiveTick(
++                pos.hashCode(),
++                dev.supervertex.SuperVertexTickScheduler.PHASE_BE_THROTTLE,
++                tickRate, currentTick)) {
+             return tickRate; // 当番 tick: tickRate 回分まとめて実行
+         }
+         return 0; // 非当番 tick: スキップ

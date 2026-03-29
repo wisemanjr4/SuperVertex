@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Mon, 30 Mar 2026 01:38:44 +0900
+Subject: [PATCH] feat: Block Entity Throttle + Hopper Throttle
+
+Skip ticking far-from-player block entities to reduce main thread load.
+- BE Throttle: furnace/blast_furnace/smoker/brewing_stand/campfire/soul_campfire
+  skip when beyond blockEntityThrottleNearChunks (default 4 chunks), tick
+  every blockEntityThrottleTickRate ticks (default 4, 75% reduction).
+- Hopper Throttle: same distance check but conservative tick rate 2 (50%
+  reduction) to minimize impact on item transport farms.
+Player positions snapshotted once per tickBlockEntities() call into a
+reused int[] array. Pos hashCode staggering distributes skipped ticks
+evenly across all ticks (same approach as Entity Deep Sleep).
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 10f8ad77934d1f8ff96e765c6f61f39117a8c2d9..7b7433282d7c3262c2726712fcfb57b7292f75c5 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -337,6 +337,84 @@ public class SuperVertexConfig {
+         if (entityDeepSleepTickRate < 1) entityDeepSleepTickRate = 1;
+     }
+ 
++    // =========================================================
++    // Block Entity Throttle
++    // =========================================================
++
++    /**
++     * プレイヤーから遠い溶鉱炉・醸造台・かまど・キャンプファイア等の
++     * Block Entity tick を間引くか。
++     * 遠方の未使用 BE が多い環境（放置施設等）でメインスレッド負荷を削減する。
++     * デフォルト: true
++     */
++    public static boolean blockEntityThrottle = true;
++
++    private static void blockEntityThrottle() {
++        blockEntityThrottle = getBoolean("performance.block-entity-throttle", blockEntityThrottle);
++    }
++
++    /**
++     * Block Entity Throttle: フルスピード tick を維持するプレイヤーからの半径（チャンク数）。
++     * デフォルト: 4
++     */
++    public static int blockEntityThrottleNearChunks = 4;
++
++    private static void blockEntityThrottleNearChunks() {
++        blockEntityThrottleNearChunks = getInt("performance.block-entity-throttle-near-chunks", blockEntityThrottleNearChunks);
++        if (blockEntityThrottleNearChunks < 0) blockEntityThrottleNearChunks = 0;
++    }
++
++    /**
++     * Block Entity Throttle: 遠方 BE が tick される間隔（N tick に 1 回）。
++     * 例: 4 = 4 tick に 1 回（75% 削減）。BE 座標ハッシュでスタガリングして負荷を均等分散。
++     * デフォルト: 4
++     */
++    public static int blockEntityThrottleTickRate = 4;
++
++    private static void blockEntityThrottleTickRate() {
++        blockEntityThrottleTickRate = getInt("performance.block-entity-throttle-tick-rate", blockEntityThrottleTickRate);
++        if (blockEntityThrottleTickRate < 1) blockEntityThrottleTickRate = 1;
++    }
++
++    // =========================================================
++    // Hopper Throttle
++    // =========================================================
++
++    /**
++     * プレイヤーから遠いホッパーの tick を間引くか。
++     * BE Throttle より保守的なデフォルト設定（2 tick に 1 回）で、
++     * ファームへの影響を最小限に抑えつつホッパーチェーンの負荷を削減する。
++     * デフォルト: true
++     */
++    public static boolean hopperThrottle = true;
++
++    private static void hopperThrottle() {
++        hopperThrottle = getBoolean("performance.hopper-throttle", hopperThrottle);
++    }
++
++    /**
++     * Hopper Throttle: フルスピードを維持するプレイヤーからの半径（チャンク数）。
++     * デフォルト: 4
++     */
++    public static int hopperThrottleNearChunks = 4;
++
++    private static void hopperThrottleNearChunks() {
++        hopperThrottleNearChunks = getInt("performance.hopper-throttle-near-chunks", hopperThrottleNearChunks);
++        if (hopperThrottleNearChunks < 0) hopperThrottleNearChunks = 0;
++    }
++
++    /**
++     * Hopper Throttle: 遠方ホッパーが tick される間隔（N tick に 1 回）。
++     * 2 = アイテム転送速度が半分。プレイヤー不在の倉庫・自動化施設向け。
++     * デフォルト: 2
++     */
++    public static int hopperThrottleTickRate = 2;
++
++    private static void hopperThrottleTickRate() {
++        hopperThrottleTickRate = getInt("performance.hopper-throttle-tick-rate", hopperThrottleTickRate);
++        if (hopperThrottleTickRate < 1) hopperThrottleTickRate = 1;
++    }
++
+     // =========================================================
+     // 設定の再読み込み
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index 24756bb1913eb1f00dc367dd9c9741a3805ef3b4..752e69ad6d7e51928f614f61ba1b0b07ccfa12ac 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -1024,6 +1024,61 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(ticker);
+     }
+ 
++    // SuperVertex start - Block Entity Throttle / Hopper Throttle
++    // tickBlockEntities() 内でプレイヤー距離チェックに使うスナップショット（再利用配列）
++    private int[] beThrottlePlayerChunkXZ = new int[0];
++    private int   beThrottlePlayerCount   = 0;
++
++    /**
++     * Block Entity の種別ごとのスロットル判定。
++     * 遠方かつ今 tick にスロットル対象なら true を返す（= tick をスキップ）。
++     *
++     * スロットル対象 BE:
++     *   furnace / blast_furnace / smoker / brewing_stand / campfire / soul_campfire
++     *   → blockEntityThrottle 設定で制御
++     *   hopper → hopperThrottle 設定で制御（保守的なレート）
++     */
++    private boolean shouldThrottleBlockEntity(TickingBlockEntity tbe) {
++        final String type = tbe.getType();
++        final boolean isHopper = "minecraft:hopper".equals(type);
++        final boolean isSafeBe;
++        if (isHopper) {
++            if (!dev.supervertex.SuperVertexConfig.hopperThrottle) return false;
++            isSafeBe = true;
++        } else if (dev.supervertex.SuperVertexConfig.blockEntityThrottle) {
++            isSafeBe = "minecraft:furnace".equals(type)
++                    || "minecraft:blast_furnace".equals(type)
++                    || "minecraft:smoker".equals(type)
++                    || "minecraft:brewing_stand".equals(type)
++                    || "minecraft:campfire".equals(type)
++                    || "minecraft:soul_campfire".equals(type);
++        } else {
++            return false;
++        }
++        if (!isSafeBe) return false;
++
++        // プレイヤー近接チェック
++        final int nearChunks = isHopper
++                ? dev.supervertex.SuperVertexConfig.hopperThrottleNearChunks
++                : dev.supervertex.SuperVertexConfig.blockEntityThrottleNearChunks;
++        final BlockPos pos = tbe.getPos();
++        final int chunkX = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getX());
++        final int chunkZ = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getZ());
++        for (int i = 0; i < beThrottlePlayerCount; i++) {
++            final int dx = Math.abs(beThrottlePlayerChunkXZ[i * 2]     - chunkX);
++            final int dz = Math.abs(beThrottlePlayerChunkXZ[i * 2 + 1] - chunkZ);
++            if (Math.max(dx, dz) <= nearChunks) return false; // 近くにプレイヤーがいる → スキップしない
++        }
++
++        // 遠方 — 座標ハッシュでスタガリングして負荷を各 tick に均等分散
++        final int tickRate = isHopper
++                ? dev.supervertex.SuperVertexConfig.hopperThrottleTickRate
++                : dev.supervertex.SuperVertexConfig.blockEntityThrottleTickRate;
++        final long currentTick = net.minecraft.server.MinecraftServer.currentTick;
++        return (currentTick % tickRate) != (Math.abs(pos.hashCode()) % tickRate);
++    }
++    // SuperVertex end - Block Entity Throttle / Hopper Throttle
++
+     protected void tickBlockEntities() {
+         //ProfilerFiller gameprofilerfiller = this.getProfiler(); // Purpur
+ 
+@@ -1036,6 +1091,22 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         }
+         //timings.tileEntityPending.stopTiming(); // Spigot // Purpur
+ 
++        // SuperVertex start - BE/Hopper Throttle: プレイヤー位置スナップショットを毎 tick 更新
++        // tickBlockEntities() 冒頭で1回だけ取得し、ループ内では配列参照のみで安価に距離計算する。
++        if (dev.supervertex.SuperVertexConfig.blockEntityThrottle
++                || dev.supervertex.SuperVertexConfig.hopperThrottle) {
++            java.util.List<? extends net.minecraft.world.entity.player.Player> _bePlayers = this.players();
++            int _beNeeded = _bePlayers.size() * 2;
++            if (beThrottlePlayerChunkXZ.length < _beNeeded) beThrottlePlayerChunkXZ = new int[_beNeeded + 8];
++            beThrottlePlayerCount = _bePlayers.size();
++            for (int _i = 0; _i < beThrottlePlayerCount; _i++) {
++                net.minecraft.world.entity.player.Player _bp = _bePlayers.get(_i);
++                beThrottlePlayerChunkXZ[_i * 2]     = net.minecraft.core.SectionPos.blockToSectionCoord(_bp.getBlockX());
++                beThrottlePlayerChunkXZ[_i * 2 + 1] = net.minecraft.core.SectionPos.blockToSectionCoord(_bp.getBlockZ());
++            }
++        }
++        // SuperVertex end
++
+         //timings.tileEntityTick.startTiming(); // Spigot // Purpur
+         // Spigot start
+         // Iterator iterator = this.blockEntityTickers.iterator();
+@@ -1059,7 +1130,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+                 toRemove.add(tickingblockentity); // Paper - use removeAll
+                 // Spigot end
+             } else if (this.shouldTickBlocksAt(tickingblockentity.getPos())) {
++                // SuperVertex start - BE/Hopper Throttle: 遠方 BE の tick を間引く
++                if (!shouldThrottleBlockEntity(tickingblockentity)) {
+                 tickingblockentity.tick();
++                } // SuperVertex end
+                 // Paper start - execute chunk tasks during tick
+                 if ((this.tileTickPosition & 7) == 0) {
+                     MinecraftServer.getServer().executeMidTickTasks();

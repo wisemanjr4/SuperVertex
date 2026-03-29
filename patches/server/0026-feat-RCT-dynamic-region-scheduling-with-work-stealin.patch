@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Sun, 29 Mar 2026 18:18:35 +0900
+Subject: [PATCH] feat: RCT dynamic region scheduling with work-stealing
+
+Replace static 1-region-per-task assignment with AtomicInteger counter.
+Workers loop on getAndIncrement() until all regions consumed.
+Main thread also steals remaining regions after finishing region[0].
+Worker count capped at min(regions-1, pool parallelism) to avoid
+excess wakeup cost when regions >> threads.
+
+diff --git a/src/main/java/dev/supervertex/RegionizedChunkTicker.java b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+index dc8e549f7ff52db3aa3c89481947f743a48355a7..2214fc1927a06a6e9a3507a1060f57f6cf848848 100644
+--- a/src/main/java/dev/supervertex/RegionizedChunkTicker.java
++++ b/src/main/java/dev/supervertex/RegionizedChunkTicker.java
+@@ -332,6 +332,11 @@ public final class RegionizedChunkTicker {
+      *   ワーカーは unsafe ブロックの randomTick を RCT_DEFERRED に積む。
+      *   latch.await() 完了後にメインスレッドで ALL_DEFERRED をドレインし、
+      *   全 Bukkit イベントをメインスレッドで正しく発火する。
++     *
++     * 動的スケジューリング:
++     *   AtomicInteger カウンタで各ワーカーが空き次第次のリージョンを取得する。
++     *   静的 1-to-1 割り当てと違い、小リージョン担当スレッドがアイドルにならない。
++     *   メインスレッドも regions[0] 完了後にカウンタからリージョンを盗む。
+      */
+     public static void tickRegionsParallel(List<List<LevelChunk>> regions, Consumer<LevelChunk> tickAction) {
+         if (regions.isEmpty()) return;
+@@ -344,23 +349,32 @@ public final class RegionizedChunkTicker {
+             return;
+         }
+ 
+-        // regions[1..] を RCT_POOL ワーカーへ委ねる
+-        int workerCount = regions.size() - 1;
+-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(workerCount);
+-        java.util.concurrent.atomic.AtomicReference<Throwable> firstError =
++        // 動的スケジューリング: AtomicInteger カウンタで各スレッドがリージョンを動的に取得
++        // 起動タスク数 = min(ワーカーリージョン数, プール並列度)
++        // → 過剰タスク起動によるスレッドウェイクアップコストを防ぐ
++        final int totalRegions = regions.size();
++        final java.util.concurrent.atomic.AtomicInteger nextRegionIdx =
++                new java.util.concurrent.atomic.AtomicInteger(1); // index 0 はメインスレッド用
++        final int workerCount = Math.min(totalRegions - 1, SuperVertexThreadPool.RCT_POOL.getParallelism());
++        final java.util.concurrent.CountDownLatch latch =
++                new java.util.concurrent.CountDownLatch(workerCount);
++        final java.util.concurrent.atomic.AtomicReference<Throwable> firstError =
+                 new java.util.concurrent.atomic.AtomicReference<>();
+ 
+-        for (int i = 1; i < regions.size(); i++) {
+-            final List<LevelChunk> region = regions.get(i);
++        for (int i = 0; i < workerCount; i++) {
+             SuperVertexThreadPool.RCT_POOL.execute(() -> {
+                 IN_RCT_CONTEXT.set(true);
+-                // Phase 2: ワーカーの Deferred キューをグローバルに登録
++                // Phase 2: ワーカーの Deferred キューをグローバルに登録（スレッドごとに 1 回）
+                 java.util.ArrayDeque<Runnable> deferred = RCT_DEFERRED.get();
+                 deferred.clear(); // 前回の残留を除去
+                 ALL_DEFERRED.add(deferred);
+                 try {
+-                    for (LevelChunk chunk : region) {
+-                        tickAction.accept(chunk);
++                    // 空き次第カウンタから次のリージョンを取得して処理
++                    int idx;
++                    while ((idx = nextRegionIdx.getAndIncrement()) < totalRegions) {
++                        for (LevelChunk chunk : regions.get(idx)) {
++                            tickAction.accept(chunk);
++                        }
+                     }
+                 } catch (Throwable t) {
+                     firstError.compareAndSet(null, t);
+@@ -376,6 +390,16 @@ public final class RegionizedChunkTicker {
+         for (LevelChunk chunk : regions.get(0)) {
+             tickAction.accept(chunk);
+         }
++        // メインスレッドもカウンタから残りリージョンを盗む（ワークスティーリング参加）
++        // IN_RCT_CONTEXT = false のまま → unsafe ブロックは即時実行
++        {
++            int idx;
++            while ((idx = nextRegionIdx.getAndIncrement()) < totalRegions) {
++                for (LevelChunk chunk : regions.get(idx)) {
++                    tickAction.accept(chunk);
++                }
++            }
++        }
+ 
+         // 全ワーカーの完了を待機
+         try {
