@@ -44,3 +44,7 @@ desktop.ini
 # Generated source directories (applyPatches で自動生成)
 SuperVertex-API/
 SuperVertex-Server/
+
+# Claude Code
+.claude/
+build_output.txt

@@ -18,6 +18,8 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 - **Block Safety Cache** — unsafe ブロックの判定を `instanceof × 22` → `配列アクセス × 1` に削減
 - **Deferred キュー** — Bukkit イベントを発火するブロック（作物・火・葉等）はメインスレッドで安全に実行
 - **Phase 1 / Phase 2 分離** — 雷・氷雪形成（Bukkit イベント含む）はメインスレッドで先行実行し、randomTick のみ並列化
+- **リージョンキャッシュ** — XOR フィンガープリントでチャンクセットの変化を O(N) で検出し、プレイヤー静止中は Union-Find 再計算をスキップ
+- **動的スケジューリング** — `AtomicInteger` カウンタでワーカーが空き次第次のリージョンを取得（小リージョン担当スレッドのアイドルを排除）。メインスレッドも余剰リージョンを横取りするワークスティーリングに参加
 - 小リージョン・単一リージョン時は自動的にシリアル実行に切り替えてオーバーヘッドを排除
 
 ### Async Entity Tracker
@@ -27,6 +29,9 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 ### Dynamic Random Tick Speed
 プレイヤーから遠いチャンクの `randomTickSpeed` を動的に削減します。
 広い view-distance 環境でのメインスレッド負荷削減に有効です（デフォルト無効）。
+
+- チャンク距離の計算結果はプレイヤー位置フィンガープリントでキャッシュ — プレイヤー静止中は全チャンク分の距離計算を完全スキップ
+- RCT 使用時はワーカー起動前にメインスレッドが一括プリコンピュート（ワーカーはキャッシュ参照のみ）
 
 ### その他の最適化
 
@@ -39,6 +44,9 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 | Per-Tick Permission Cache | 同一 tick 内のパーミッション判定をキャッシュして LuckPerms 負荷を削減 |
 | Entity Tracker Buffer Reuse | `processTrackQueue` の `ArrayList` を再利用バッファ化して GC 削減 |
 | Entity Deep Sleep | 長時間非アクティブエンティティの `inactiveTick()` 自体を 4 tick に 1 回に削減。EAR/DAB がゴールセレクターを間引くのに対し、fire tick・移動・属性更新等のエントリコストも削減 |
+| RCT Region Cache | XOR フィンガープリントでチャンクセット変化を検出。プレイヤー静止中は Union-Find 再計算を完全スキップ |
+| RCT Dynamic Scheduling | AtomicInteger カウンタによる動的リージョン割り当て + メインスレッドによるワークスティーリング |
+| Dynamic Speed Cache | `computeAdjustedRandomTickSpeed` 結果をプレイヤー位置ハッシュでキャッシュ。静止中は全チャンクの距離計算をスキップ |
 | Attribute Map CME Fix | `dirtyAttributes` を `ConcurrentHashMap.KeySet` に変更し、非同期プラグイン起因の CME を防止 |
 | broadcastChanges Null Guard | RCT 環境下での non-full chunk への NPE をガード |
 
@@ -166,6 +174,9 @@ git push origin main
 | 0022 | RCT: リージョン負荷分散・per-tick アロケーション削減 |
 | 0023 | Dynamic Random Tick Speed・Entity Tracker バッファ再利用・Mob Spawn Throttle 完全化 |
 | 0024 | Entity Deep Sleep（長時間非アクティブエンティティの `inactiveTick()` スロットル） |
+| 0025 | RCT リージョンキャッシュ（XOR フィンガープリントで Union-Find 再計算をスキップ） |
+| 0026 | RCT 動的スケジューリング（AtomicInteger カウンタ + メインスレッドワークスティーリング） |
+| 0027 | Dynamic Random Tick Speed キャッシュ（プレイヤー静止中の距離計算を完全スキップ） |
 
 ---
 
