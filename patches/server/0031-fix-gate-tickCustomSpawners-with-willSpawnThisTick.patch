@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Mon, 6 Apr 2026 15:00:10 +0900
+Subject: [PATCH] fix: gate tickCustomSpawners with willSpawnThisTick
+
+Removing the flag2 throttle override caused tickCustomSpawners to run
+every tick instead of every mobSpawnThrottleTicks ticks, causing ~4x
+extra load (phantom/cat/etc spawner checks). Gate with willSpawnThisTick
+to restore original throttle behavior.
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 6732e955cbe7ed35d9de3219b1076f6b2a5cf0f0..b6011153e30a4c03f7fca6ac6b10e6f57593ac42 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -927,7 +927,9 @@ public class ServerChunkCache extends ChunkSource {
+             // SuperVertex end - RCT Phase 2
+             //this.level.timings.chunkTicks.stopTiming(); // Paper // Purpur
+             //gameprofilerfiller.popPush("customSpawners"); // Purpur
+-            if (flag2) {
++            // SuperVertex - tickCustomSpawners は willSpawnThisTick で throttle する。
++            // flag2 の throttle override を削除したため willSpawnThisTick で代替。
++            if (flag2 && willSpawnThisTick) {
+                 //try (co.aikar.timings.Timing ignored = this.level.timings.miscMobSpawning.startTiming()) { // Paper - timings // Purpur
+                 this.level.tickCustomSpawners(this.spawnEnemies, this.spawnFriendlies);
+                 //} // Paper - timings // Purpur
