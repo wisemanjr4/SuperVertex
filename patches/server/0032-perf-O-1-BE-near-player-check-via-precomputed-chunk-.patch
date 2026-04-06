@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Mon, 6 Apr 2026 15:52:24 +0900
+Subject: [PATCH] perf: O(1) BE near-player check via precomputed chunk sets
+
+Replace O(N_BE * N_players) distance loop in getBlockEntityTickBatch()
+with O(1) LongOpenHashSet lookup. Build two sets per tick (beNearChunkSet
+and hopperNearChunkSet) by expanding each player's position over nearChunks
+radius once at start of tickBlockEntities(). Cost: O(players * nearChunks^2)
+precompute vs O(BEs * players) lookups saved. Significant on servers with
+many BEs (furnace farms, hopper chains) and multiple players.
+
+diff --git a/src/main/java/net/minecraft/world/level/Level.java b/src/main/java/net/minecraft/world/level/Level.java
+index 599be1b905c3fc2e4de412df01f5273e2395df25..b309ddca50b2747b618f0e73e4c65d30d6c34f72 100644
+--- a/src/main/java/net/minecraft/world/level/Level.java
++++ b/src/main/java/net/minecraft/world/level/Level.java
+@@ -1028,6 +1028,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+     // tickBlockEntities() 内でプレイヤー距離チェックに使うスナップショット（再利用配列）
+     private int[] beThrottlePlayerChunkXZ = new int[0];
+     private int   beThrottlePlayerCount   = 0;
++    // 近接チャンクセット: プレイヤー位置 × nearChunks 半径を事前展開して O(1) ルックアップに。
++    // per-BE の O(N_players) ループを排除する。毎 tick スナップショット更新時に再構築。
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet _beNearChunkSet     = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(256, 0.5f);
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet _hopperNearChunkSet = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(256, 0.5f);
+ 
+     /**
+      * Block Entity のバッチ tick 数を返す。
+@@ -1068,18 +1072,13 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         }
+         if (!isSafeBe) return 1;
+ 
+-        // プレイヤー近接チェック: 近傍なら通常 tick
+-        final int nearChunks = isHopper
+-                ? dev.supervertex.SuperVertexConfig.hopperThrottleNearChunks
+-                : dev.supervertex.SuperVertexConfig.blockEntityThrottleNearChunks;
++        // プレイヤー近接チェック: 事前構築セットで O(1) ルックアップ
++        // O(N_players) ループを排除し、全 BE × 全プレイヤーの組み合わせコストをゼロにする。
+         final BlockPos pos = tbe.getPos();
+-        final int chunkX = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getX());
+-        final int chunkZ = net.minecraft.core.SectionPos.blockToSectionCoord(pos.getZ());
+-        for (int i = 0; i < beThrottlePlayerCount; i++) {
+-            final int dx = Math.abs(beThrottlePlayerChunkXZ[i * 2]     - chunkX);
+-            final int dz = Math.abs(beThrottlePlayerChunkXZ[i * 2 + 1] - chunkZ);
+-            if (Math.max(dx, dz) <= nearChunks) return 1; // 近くにプレイヤーがいる → 通常 tick
+-        }
++        final long _chunkKey = net.minecraft.world.level.ChunkPos.asLong(
++                net.minecraft.core.SectionPos.blockToSectionCoord(pos.getX()),
++                net.minecraft.core.SectionPos.blockToSectionCoord(pos.getZ()));
++        if ((isHopper ? _hopperNearChunkSet : _beNearChunkSet).contains(_chunkKey)) return 1;
+ 
+         // 遠方 — 座標ハッシュで当番 tick を決定してスタガリング
+         final int tickRate = isHopper
+@@ -1108,8 +1107,9 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+         }
+         //timings.tileEntityPending.stopTiming(); // Spigot // Purpur
+ 
+-        // SuperVertex start - BE/Hopper Throttle: プレイヤー位置スナップショットを毎 tick 更新
+-        // tickBlockEntities() 冒頭で1回だけ取得し、ループ内では配列参照のみで安価に距離計算する。
++        // SuperVertex start - BE/Hopper Throttle: プレイヤー位置スナップショット + 近接チャンクセット構築
++        // tickBlockEntities() 冒頭で1回だけ実行。ループ内は配列/セット参照のみ。
++        // セット構築: O(N_players × nearChunks²) ≪ per-BE ループ O(N_BE × N_players)
+         if (dev.supervertex.SuperVertexConfig.blockEntityThrottle
+                 || dev.supervertex.SuperVertexConfig.hopperThrottle) {
+             java.util.List<? extends net.minecraft.world.entity.player.Player> _bePlayers = this.players();
+@@ -1121,6 +1121,27 @@ public abstract class Level implements LevelAccessor, AutoCloseable {
+                 beThrottlePlayerChunkXZ[_i * 2]     = net.minecraft.core.SectionPos.blockToSectionCoord(_bp.getBlockX());
+                 beThrottlePlayerChunkXZ[_i * 2 + 1] = net.minecraft.core.SectionPos.blockToSectionCoord(_bp.getBlockZ());
+             }
++            // 近接チャンクセット構築 — 各プレイヤー周辺の正方形グリッドを展開
++            if (dev.supervertex.SuperVertexConfig.blockEntityThrottle) {
++                _beNearChunkSet.clear();
++                final int _beNear = dev.supervertex.SuperVertexConfig.blockEntityThrottleNearChunks;
++                for (int _i = 0; _i < beThrottlePlayerCount; _i++) {
++                    final int _px = beThrottlePlayerChunkXZ[_i * 2], _pz = beThrottlePlayerChunkXZ[_i * 2 + 1];
++                    for (int _dx = -_beNear; _dx <= _beNear; _dx++)
++                        for (int _dz = -_beNear; _dz <= _beNear; _dz++)
++                            _beNearChunkSet.add(net.minecraft.world.level.ChunkPos.asLong(_px + _dx, _pz + _dz));
++                }
++            }
++            if (dev.supervertex.SuperVertexConfig.hopperThrottle) {
++                _hopperNearChunkSet.clear();
++                final int _hNear = dev.supervertex.SuperVertexConfig.hopperThrottleNearChunks;
++                for (int _i = 0; _i < beThrottlePlayerCount; _i++) {
++                    final int _px = beThrottlePlayerChunkXZ[_i * 2], _pz = beThrottlePlayerChunkXZ[_i * 2 + 1];
++                    for (int _dx = -_hNear; _dx <= _hNear; _dx++)
++                        for (int _dz = -_hNear; _dz <= _hNear; _dz++)
++                            _hopperNearChunkSet.add(net.minecraft.world.level.ChunkPos.asLong(_px + _dx, _pz + _dz));
++                }
++            }
+         }
+         // SuperVertex end
+ 
