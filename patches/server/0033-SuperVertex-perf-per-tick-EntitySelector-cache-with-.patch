@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Wed, 8 Apr 2026 20:43:37 +0900
+Subject: [PATCH] SuperVertex: perf - per-tick EntitySelector cache with
+ dirty-flag invalidation
+
+
+diff --git a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java b/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java
+index 7e66aaa960ce7b6dda7c064d4c6856cc4b368b58..73360d7c4c0eabd020fe1f29f7f81945d9167009 100644
+--- a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java
++++ b/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java
+@@ -54,6 +54,9 @@ public class EntitySelector {
+     private final UUID entityUUID;
+     private final EntityTypeTest<Entity, ?> type;
+     private final boolean usesSelector;
++    // SuperVertex start - per-tick EntitySelector cache
++    @Nullable String _svRawSelector = null;
++    // SuperVertex end
+ 
+     public EntitySelector(int count, boolean includesNonPlayers, boolean localWorldOnly, Predicate<Entity> basePredicate, MinMaxBounds.Doubles distance, Function<Vec3, Vec3> positionOffset, @Nullable AABB box, BiConsumer<Vec3, List<? extends Entity>> sorter, boolean senderOnly, @Nullable String playerName, @Nullable UUID uuid, @Nullable EntityType<?> type, boolean usesAt) {
+         this.maxResults = count;
+@@ -118,6 +121,24 @@ public class EntitySelector {
+ 
+     private List<? extends Entity> findEntitiesRaw(CommandSourceStack source) throws CommandSyntaxException {
+         this.checkPermissions(source);
++        // SuperVertex start - per-tick EntitySelector cache
++        // キャッシュ条件: 距離指定なし・AABBなし・単一ワールド・@s/@p名前/UUID指定なし・dirty フラグなし
++        if (this._svRawSelector != null
++                && this.range.isAny()
++                && this.aabb == null
++                && this.worldLimited
++                && !this.currentEntity
++                && this.playerName == null
++                && this.entityUUID == null) {
++            net.minecraft.server.level.ServerLevel _svLevel = source.getLevel();
++            if (!_svLevel._svSelectorCacheDirty) {
++                @SuppressWarnings("unchecked")
++                java.util.List<? extends Entity> _svCached = _svLevel._svSelectorCache.get(this._svRawSelector);
++                if (_svCached != null) return _svCached;
++                // キャッシュミス: 後でputするためフォールスルー
++            }
++        }
++        // SuperVertex end
+         if (!this.includesEntities) {
+             return this.findPlayers(source);
+         } else if (this.playerName != null) {
+@@ -161,7 +182,19 @@ public class EntitySelector {
+                     }
+                 }
+ 
+-                return this.sortAndLimit(vec3d, list);
++                java.util.List<? extends Entity> _svResult = this.sortAndLimit(vec3d, list);
++                // SuperVertex start - per-tick EntitySelector cache: キャッシュ条件を満たす場合は格納
++                if (this._svRawSelector != null
++                        && this.range.isAny()
++                        && this.aabb == null
++                        && this.worldLimited) {
++                    net.minecraft.server.level.ServerLevel _svLevel = source.getLevel();
++                    if (!_svLevel._svSelectorCacheDirty) {
++                        _svLevel._svSelectorCache.put(this._svRawSelector, _svResult);
++                    }
++                }
++                // SuperVertex end
++                return _svResult;
+             }
+         }
+     }
+diff --git a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelectorParser.java b/src/main/java/net/minecraft/commands/arguments/selector/EntitySelectorParser.java
+index 4cc2ee22369aef22c9bf9d2b244c7278d6db39bb..50bef1b1d66c5c6894b2464f2427fd7e502c6a0e 100644
+--- a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelectorParser.java
++++ b/src/main/java/net/minecraft/commands/arguments/selector/EntitySelectorParser.java
+@@ -71,6 +71,7 @@ public class EntitySelectorParser {
+     };
+     private final StringReader reader;
+     private final boolean allowSelectors;
++    private int _svStartCursor; // SuperVertex - per-tick selector cache
+     private int maxResults;
+     private boolean includesEntities;
+     private boolean worldLimited;
+@@ -126,6 +127,7 @@ public class EntitySelectorParser {
+     public EntitySelectorParser(StringReader reader, boolean atAllowed, boolean parsingEntityArgumentSuggestions) {
+         this.parsingEntityArgumentSuggestions = parsingEntityArgumentSuggestions;
+         // Paper end
++        this._svStartCursor = reader.getCursor(); // SuperVertex - per-tick selector cache
+         this.distance = MinMaxBounds.Doubles.ANY;
+         this.level = MinMaxBounds.Ints.ANY;
+         this.rotX = WrappedMinMaxBounds.ANY;
+@@ -166,7 +168,11 @@ public class EntitySelectorParser {
+             };
+         }
+ 
+-        return new EntitySelector(this.maxResults, this.includesEntities, this.worldLimited, this.predicate, this.distance, function, axisalignedbb, this.order, this.currentEntity, this.playerName, this.entityUUID, this.type, this.usesSelectors);
++        EntitySelector _svSelector = new EntitySelector(this.maxResults, this.includesEntities, this.worldLimited, this.predicate, this.distance, function, axisalignedbb, this.order, this.currentEntity, this.playerName, this.entityUUID, this.type, this.usesSelectors);
++        // SuperVertex start - per-tick selector cache: パース済み生文字列を格納
++        _svSelector._svRawSelector = this.reader.getString().substring(this._svStartCursor, this.reader.getCursor());
++        // SuperVertex end
++        return _svSelector;
+     }
+ 
+     private AABB createAabb(double x, double y, double z) {
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index fdcffb94bffbfbc5330254ab400ad56c33bc24f0..44e7baac75aaef61f208829182c939b1328f5b46 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -646,6 +646,10 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     }
+ 
+     public void tick(BooleanSupplier shouldKeepTicking) {
++        // SuperVertex start - per-tick EntitySelector cache: tick冒頭でリセット
++        this._svSelectorCacheDirty = false;
++        this._svSelectorCache.clear();
++        // SuperVertex end
+         // Paper start - optimise checkDespawn
+         this.playersAffectingSpawning.clear();
+         for (ServerPlayer player : this.players) {
+@@ -2752,6 +2756,11 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     }
+     // Paper end
+ 
++    // SuperVertex start - per-tick EntitySelector cache
++    public boolean _svSelectorCacheDirty = false;
++    public final java.util.HashMap<String, java.util.List<? extends net.minecraft.world.entity.Entity>> _svSelectorCache = new java.util.HashMap<>();
++    // SuperVertex end
++
+     private final class EntityCallbacks implements LevelCallback<Entity> {
+ 
+         EntityCallbacks() {}
+@@ -2760,6 +2769,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+         public void onDestroyed(Entity entity) {
+             ServerLevel.this.getScoreboard().entityRemoved(entity);
++            ServerLevel.this._svSelectorCacheDirty = true; // SuperVertex - per-tick selector cache
+         }
+ 
+         public void onTickingStart(Entity entity) {
+@@ -2779,6 +2789,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+         public void onTrackingStart(Entity entity) {
+             org.spigotmc.AsyncCatcher.catchOp("entity register"); // Spigot
++            ServerLevel.this._svSelectorCacheDirty = true; // SuperVertex - per-tick selector cache
+             // ServerLevel.this.getChunkSource().addEntity(entity); // Paper - moved down below valid=true
+             if (entity instanceof ServerPlayer) {
+                 ServerPlayer entityplayer = (ServerPlayer) entity;
