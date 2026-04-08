@@ -47,6 +47,9 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 | RCT Region Cache | XOR フィンガープリントでチャンクセット変化を検出。プレイヤー静止中は Union-Find 再計算を完全スキップ |
 | RCT Dynamic Scheduling | AtomicInteger カウンタによる動的リージョン割り当て + メインスレッドによるワークスティーリング |
 | Dynamic Speed Cache | `computeAdjustedRandomTickSpeed` 結果をプレイヤー位置ハッシュでキャッシュ。静止中は全チャンクの距離計算をスキップ |
+| BE/Hopper Batch Tick | N tick に 1 回の active tick でまとめて N 回処理。tick 数は座標ハッシュで分散させラグスパイクを回避。バニラと同一挙動（線形操作はバッチでも等価） |
+| Tick Phase Coordination | mob spawn・BE throttle・chunk tick・deep sleep の周期をずらし、同一 tick への集中を排除してスパイクを平滑化 |
+| O(1) BE Near-Player Check | tickBlockEntities() 冒頭で近傍チャンクの `LongOpenHashSet` を構築。per-BE の O(N_players) ループを O(1) ハッシュルックアップに置換 |
 | Attribute Map CME Fix | `dirtyAttributes` を `ConcurrentHashMap.KeySet` に変更し、非同期プラグイン起因の CME を防止 |
 | broadcastChanges Null Guard | RCT 環境下での non-full chunk への NPE をガード |
 
@@ -107,6 +110,25 @@ performance:
 
   # Deep Sleep 中のエンティティが inactiveTick() を呼ぶ間隔 (デフォルト: 4 tick に 1 回)
   entity-deep-sleep-tick-rate: 4
+
+  # Block Entity (furnace, hopper 等) の throttle を有効にするか
+  # プレイヤーから遠い BE を間引いて tick し、近くなったら通常に戻す
+  block-entity-throttle: true
+
+  # BE throttle: 通常 tick するプレイヤー周辺の半径 (チャンク数)
+  block-entity-throttle-near-chunks: 4
+
+  # BE throttle: 遠方 BE を何 tick に 1 回 tick するか
+  block-entity-throttle-ticks: 4
+
+  # Hopper throttle を有効にするか (block-entity-throttle と独立して設定可)
+  hopper-throttle: true
+
+  # Hopper throttle: 通常 tick するプレイヤー周辺の半径 (チャンク数)
+  hopper-throttle-near-chunks: 4
+
+  # Hopper throttle: 遠方 hopper を何 tick に 1 回 tick するか
+  hopper-throttle-ticks: 4
 ```
 
 ---
@@ -177,6 +199,11 @@ git push origin main
 | 0025 | RCT リージョンキャッシュ（XOR フィンガープリントで Union-Find 再計算をスキップ） |
 | 0026 | RCT 動的スケジューリング（AtomicInteger カウンタ + メインスレッドワークスティーリング） |
 | 0027 | Dynamic Random Tick Speed キャッシュ（プレイヤー静止中の距離計算を完全スキップ） |
+| 0028 | BE/Hopper Batch Tick（N tick 分を 1 tick で処理・バニラ互換） |
+| 0029 | Tick Phase Coordination（mob spawn・BE throttle・deep sleep の周期ずらしでスパイク平滑化） |
+| 0030 | *(欠番)* |
+| 0031 | tickCustomSpawners ホットフィックス（毎 tick 実行になっていたバグを修正） |
+| 0032 | O(1) BE 近接プレイヤーチェック（LongOpenHashSet 事前構築でループを排除） |
 
 ---
 
