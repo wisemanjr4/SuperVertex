@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <mitsuking2003@gmail.com>
+Date: Fri, 10 Apr 2026 18:01:39 +0900
+Subject: [PATCH] SuperVertex: Fix async tracker teleport AsyncCatcher
+ violation - defer passenger dismount teleport to main thread
+
+
+diff --git a/src/main/java/net/minecraft/server/level/ServerEntity.java b/src/main/java/net/minecraft/server/level/ServerEntity.java
+index 6f43c83b14cc8b0a81dd5a351497bc9827a029dc..0edd767303c7bd8bb3980a7f4271d1c355eac449 100644
+--- a/src/main/java/net/minecraft/server/level/ServerEntity.java
++++ b/src/main/java/net/minecraft/server/level/ServerEntity.java
+@@ -102,7 +102,17 @@ public class ServerEntity {
+                     ServerPlayer entityplayer = (ServerPlayer) entity;
+ 
+                     if (!list.contains(entityplayer)) {
+-                        entityplayer.connection.teleport(entityplayer.getX(), entityplayer.getY(), entityplayer.getZ(), entityplayer.getYRot(), entityplayer.getXRot());
++                        // SuperVertex start - async tracker: teleport must run on main thread
++                        if (net.minecraft.server.MinecraftServer.getServer().isSameThread()) {
++                            entityplayer.connection.teleport(entityplayer.getX(), entityplayer.getY(), entityplayer.getZ(), entityplayer.getYRot(), entityplayer.getXRot());
++                        } else {
++                            final double _svX = entityplayer.getX(), _svY = entityplayer.getY(), _svZ = entityplayer.getZ();
++                            final float _svYRot = entityplayer.getYRot(), _svXRot = entityplayer.getXRot();
++                            net.minecraft.server.MinecraftServer.getServer().execute(() ->
++                                entityplayer.connection.teleport(_svX, _svY, _svZ, _svYRot, _svXRot)
++                            );
++                        }
++                        // SuperVertex end
+                     }
+                 }
+ 
