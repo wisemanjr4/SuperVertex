@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: wisemanjr4 <mitsuking2003@gmail.com>
+From: wisemanjr4 <wisemanjr4@users.noreply.github.com>
 Date: Sun, 29 Mar 2026 19:32:56 +0900
 Subject: [PATCH] feat: cache computeAdjustedRandomTickSpeed results per player
  position snapshot

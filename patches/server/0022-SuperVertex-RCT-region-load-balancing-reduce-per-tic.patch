@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: wisemanjr4 <mitsuking2003@gmail.com>
+From: wisemanjr4 <wisemanjr4@users.noreply.github.com>
 Date: Tue, 24 Mar 2026 16:01:41 +0900
 Subject: [PATCH] SuperVertex: RCT region load balancing + reduce per-tick
  allocations

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: wisemanjr4 <mitsuking2003@gmail.com>
+From: wisemanjr4 <wisemanjr4@users.noreply.github.com>
 Date: Fri, 20 Mar 2026 21:07:49 +0900
 Subject: [PATCH] SuperVertex: RCT Phase 1 - split tickChunk into
  weather/random sections

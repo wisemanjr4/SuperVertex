@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: wisemanjr4 <mitsuking2003@gmail.com>
+From: wisemanjr4 <wisemanjr4@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 20:43:37 +0900
 Subject: [PATCH] SuperVertex: perf - per-tick EntitySelector cache with
  dirty-flag invalidation
