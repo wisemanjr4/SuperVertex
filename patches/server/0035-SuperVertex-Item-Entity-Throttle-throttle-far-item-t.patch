@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wisemanjr4 <wisemanjr4@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 00:05:53 +0900
+Subject: [PATCH] SuperVertex: Item Entity Throttle - throttle far item
+ tick/inactiveTick (wall-time compensated, vanilla-compatible despawn)
+
+
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+index 7b7433282d7c3262c2726712fcfb57b7292f75c5..9b5c8ef90861a86bace3652ac206bcefffabfa7d 100644
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -415,6 +415,60 @@ public class SuperVertexConfig {
+         if (hopperThrottleTickRate < 1) hopperThrottleTickRate = 1;
+     }
+ 
++    // =========================================================
++    // Item Entity Throttle
++    // =========================================================
++
++    /**
++     * プレイヤーから遠いドロップアイテム（ItemEntity）の tick を間引くか。
++     *
++     * 遠方アイテムは tick() / inactiveTick() 自体を N tick に 1 回に削減する。
++     * CraftBukkit の wall time 補正（elapsedTicks）により、スキップしても
++     * despawn タイマー・pickupDelay はバニラと同一のタイミングで進む。
++     * （BE/Hopper Batch Tick と同じ「バニラ互換」思想）
++     *
++     * スキップ中の影響:
++     *   - マージ（同種アイテムのスタック化）は遠方では遅延するが、
++     *     プレイヤーが近づくと即座に通常動作に戻る。
++     *   - ホッパーによる吸引は ItemEntity.tick() を経由しないため影響なし。
++     *   - 水流・溶岩流での移動は遠方で視認されないため実害なし。
++     *
++     * ドロップ祭り・放置トラップ・mob ファーム周辺に大量の地面アイテムが
++     * 溜まる環境でメインスレッド負荷を大幅に削減する。
++     * デフォルト: true
++     */
++    public static boolean itemEntityThrottle = true;
++
++    private static void itemEntityThrottle() {
++        itemEntityThrottle = getBoolean("performance.item-entity-throttle", itemEntityThrottle);
++    }
++
++    /**
++     * Item Entity Throttle: フルスピード tick を維持するプレイヤーからの半径（チャンク数）。
++     * この半径以内のアイテムは毎 tick 通常通り tick される（ピックアップ・マージ完全互換）。
++     * デフォルト: 4 (プレイヤー周囲 4 チャンク = 64 ブロック以内)
++     */
++    public static int itemEntityThrottleNearChunks = 4;
++
++    private static void itemEntityThrottleNearChunks() {
++        itemEntityThrottleNearChunks = getInt("performance.item-entity-throttle-near-chunks", itemEntityThrottleNearChunks);
++        if (itemEntityThrottleNearChunks < 0) itemEntityThrottleNearChunks = 0;
++    }
++
++    /**
++     * Item Entity Throttle: 遠方アイテムが tick される間隔（N tick に 1 回）。
++     * 例: 10 = 10 tick に 1 回（90% 削減）。エンティティ ID ハッシュでスタガリングし、
++     * 負荷を各 tick に均等分散する。despawn タイミングは wall time 補正で不変。
++     * Deep Sleep（rate=4）より積極的な削減が可能。
++     * デフォルト: 10
++     */
++    public static int itemEntityThrottleTickRate = 10;
++
++    private static void itemEntityThrottleTickRate() {
++        itemEntityThrottleTickRate = getInt("performance.item-entity-throttle-tick-rate", itemEntityThrottleTickRate);
++        if (itemEntityThrottleTickRate < 1) itemEntityThrottleTickRate = 1;
++    }
++
+     // =========================================================
+     // 設定の再読み込み
+     // =========================================================
+diff --git a/src/main/java/dev/supervertex/SuperVertexTickScheduler.java b/src/main/java/dev/supervertex/SuperVertexTickScheduler.java
+index d38054b491eacd39e5bb39a219e90d02458e6c37..2310f81bf8903d80fac50a14989ba71bdaeb6326 100644
+--- a/src/main/java/dev/supervertex/SuperVertexTickScheduler.java
++++ b/src/main/java/dev/supervertex/SuperVertexTickScheduler.java
+@@ -13,6 +13,7 @@ package dev.supervertex;
+  *   tick % 4 == 1  →  Chunk Tick Spread (PHASE_CHUNK_TICK=1)
+  *   tick % 4 == 2  →  BE Batch (PHASE_BE_THROTTLE=2)
+  *   tick % 4 == 3  →  Entity Deep Sleep (PHASE_DEEP_SLEEP=3)
++ *   tick % 5 == 4  →  Item Entity Throttle (PHASE_ITEM_THROTTLE=4)
+  */
+ public final class SuperVertexTickScheduler {
+ 
+@@ -34,6 +35,9 @@ public final class SuperVertexTickScheduler {
+     /** Entity Deep Sleep の位相オフセット */
+     public static final int PHASE_DEEP_SLEEP  = 3;
+ 
++    /** Item Entity Throttle の位相オフセット */
++    public static final int PHASE_ITEM_THROTTLE = 4;
++
+     // =========================================================
+     // 判定ヘルパー
+     // =========================================================
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 44e7baac75aaef61f208829182c939b1328f5b46..0ce0061a1e3b8ca5a78bb4cf876bc12734e932c5 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -732,6 +732,11 @@ public class ServerLevel extends Level implements WorldGenLevel {
+             }
+ 
+             org.spigotmc.ActivationRange.activateEntities(this); // Spigot
++            // SuperVertex start - Item Entity Throttle: 近接チャンクセットを毎 tick 再構築
++            if (dev.supervertex.SuperVertexConfig.itemEntityThrottle) {
++                this.svRebuildItemNearChunkSet();
++            }
++            // SuperVertex end - Item Entity Throttle
+             //timings.entityTick.startTiming(); // Spigot // Purpur
+             this.entityTickList.forEach((entity) -> {
+                 entity.activatedPriorityReset = false; // Pufferfish - DAB
+@@ -1410,6 +1415,57 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     }
+     // Paper end - log detailed entity tick information
+ 
++    // SuperVertex start - Item Entity Throttle: O(1) near-player check via precomputed chunk set
++    // tickEntities() 冒頭で再構築する近接チャンクセット（Level の BE throttle と同一パターン）。
++    // per-item の O(N_players) ループを排除し、全アイテム × 全プレイヤーの距離計算をゼロにする。
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet _itemNearChunkSet = new it.unimi.dsi.fastutil.longs.LongOpenHashSet(256, 0.5f);
++
++    /**
++     * Item Entity Throttle 用の近接チャンクセットを再構築する。
++     * tickEntities() 冒頭（ActivationRange.activateEntities 直後）に 1 回だけ呼ばれる。
++     * コスト: O(N_players × nearChunks²) — プレイヤー数は少数なので実質定数。
++     */
++    private void svRebuildItemNearChunkSet() {
++        _itemNearChunkSet.clear();
++        final java.util.List<? extends net.minecraft.world.entity.player.Player> _itPlayers = this.players();
++        final int _near = dev.supervertex.SuperVertexConfig.itemEntityThrottleNearChunks;
++        for (int _i = 0; _i < _itPlayers.size(); _i++) {
++            final net.minecraft.world.entity.player.Player _p = _itPlayers.get(_i);
++            final int _px = net.minecraft.core.SectionPos.blockToSectionCoord(_p.getBlockX());
++            final int _pz = net.minecraft.core.SectionPos.blockToSectionCoord(_p.getBlockZ());
++            for (int _dx = -_near; _dx <= _near; _dx++)
++                for (int _dz = -_near; _dz <= _near; _dz++)
++                    _itemNearChunkSet.add(net.minecraft.world.level.ChunkPos.asLong(_px + _dx, _pz + _dz));
++        }
++    }
++
++    /**
++     * 今 tick、このエンティティの tick / inactiveTick をスキップすべきか。
++     *
++     * 対象: ItemEntity のみ。プレイヤー近傍（nearChunks 半径以内）は常に false（通常 tick）。
++     * 遠方アイテムは座標ハッシュで当番 tick を決定してスタガリングし、
++     * スパイクを各 tick に均等分散する。
++     *
++     * スキップしても despawn タイマー・pickupDelay は CraftBukkit の wall time 補正
++     * （elapsedTicks）によりバニラと同一タイミングで進む。
++     */
++    private boolean svShouldSkipItemEntity(Entity entity) {
++        if (!dev.supervertex.SuperVertexConfig.itemEntityThrottle
++                || !(entity instanceof net.minecraft.world.entity.item.ItemEntity)) {
++            return false;
++        }
++        final net.minecraft.world.level.ChunkPos _cp = entity.chunkPosition();
++        if (_itemNearChunkSet.contains(net.minecraft.world.level.ChunkPos.asLong(_cp.x, _cp.z))) {
++            return false; // プレイヤー近傍 — 通常 tick
++        }
++        return !dev.supervertex.SuperVertexTickScheduler.isActiveTick(
++                entity.getId(),
++                dev.supervertex.SuperVertexTickScheduler.PHASE_ITEM_THROTTLE,
++                dev.supervertex.SuperVertexConfig.itemEntityThrottleTickRate,
++                net.minecraft.server.MinecraftServer.currentTick);
++    }
++    // SuperVertex end - Item Entity Throttle
++
+     public void tickNonPassenger(Entity entity) {
+         // Paper start - log detailed entity tick information
+         io.papermc.paper.util.TickThread.ensureTickThread("Cannot tick an entity off-main");
+@@ -1444,9 +1500,21 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         //gameprofilerfiller.incrementCounter("tickNonPassenger"); // Purpur
+         if (isActive) { // Paper - EAR 2
+             TimingHistory.activatedEntityTicks++;
++            // SuperVertex start - Item Entity Throttle: 遠方アイテムの tick を間引く
++            // スキップしても wall time 補正により despawn/pickupDelay はバニラ互換。
++            // EAR active（プレイヤーが activation range 内）でも nearChunks 以遠なら間引く。
++            if (this.svShouldSkipItemEntity(entity)) {
++                return; // アイテムに乗客は存在しないため早期リターン安全
++            }
++            // SuperVertex end - Item Entity Throttle
+         entity.tick();
+         entity.postTick(); // CraftBukkit
+         } else { // Paper - EAR 2
++            // SuperVertex start - Item Entity Throttle: 遠方アイテムは Deep Sleep より優先して強く間引く
++            if (this.svShouldSkipItemEntity(entity)) {
++                // skip inactiveTick this tick (wall-time timers compensate on next run)
++            } else {
++            // SuperVertex end - Item Entity Throttle
+             // SuperVertex start - Entity Deep Sleep
+             // Spigot EAR deactivates far entities; Pufferfish DAB throttles their AI goal rate.
+             // Deep Sleep goes further: throttles the inactiveTick() call itself (fire, move, attributes, etc.)
+@@ -1465,6 +1533,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                 entity.inactiveTick();
+             }
+             // SuperVertex end - Entity Deep Sleep
++            } // SuperVertex - Item Entity Throttle: close else block
+         }
+         //this.getProfiler().pop(); // Purpur
+         //} finally { timer.stopTiming(); } // Paper - timings // Purpur

@@ -50,6 +50,9 @@ Vanilla → CraftBukkit → Spigot → Paper → Purpur → Plazma → SuperVert
 | BE/Hopper Batch Tick | N tick に 1 回の active tick でまとめて N 回処理。tick 数は座標ハッシュで分散させラグスパイクを回避。バニラと同一挙動（線形操作はバッチでも等価） |
 | Tick Phase Coordination | mob spawn・BE throttle・chunk tick・deep sleep の周期をずらし、同一 tick への集中を排除してスパイクを平滑化 |
 | O(1) BE Near-Player Check | tickBlockEntities() 冒頭で近傍チャンクの `LongOpenHashSet` を構築。per-BE の O(N_players) ループを O(1) ハッシュルックアップに置換 |
+| Item Entity Throttle | プレイヤーから遠いドロップアイテムの tick / inactiveTick を N tick に 1 回に削減。wall time 補正により despawn・pickupDelay はバニラ互換のまま |
+| Per-Tick EntitySelector Cache | 目的別セレクター（@a[team=...]等）の照会結果を 1 tick キャッシュし、dirty flag で無効化 |
+| Async Tracker Teleport Fix | 乗客降車 teleport をメインスレッドへ遅延させ、非同期 tracker の AsyncCatcher 違反を解消 |
 | Attribute Map CME Fix | `dirtyAttributes` を `ConcurrentHashMap.KeySet` に変更し、非同期プラグイン起因の CME を防止 |
 | broadcastChanges Null Guard | RCT 環境下での non-full chunk への NPE をガード |
 
@@ -129,6 +132,17 @@ performance:
 
   # Hopper throttle: 遠方 hopper を何 tick に 1 回 tick するか
   hopper-throttle-ticks: 4
+
+  # ドロップアイテム (ItemEntity) の throttle を有効にするか
+  # プレイヤーから遠い地面アイテムの tick / inactiveTick を間引く
+  # wall time 補正により despawn・pickupDelay はバニラ互換のまま
+  item-entity-throttle: true
+
+  # Item throttle: 通常 tick するプレイヤー周辺の半径 (チャンク数)
+  item-entity-throttle-near-chunks: 4
+
+  # Item throttle: 遠方アイテムを何 tick に 1 回 tick するか
+  item-entity-throttle-tick-rate: 10
 ```
 
 ---
@@ -204,6 +218,9 @@ git push origin main
 | 0030 | *(欠番)* |
 | 0031 | tickCustomSpawners ホットフィックス（毎 tick 実行になっていたバグを修正） |
 | 0032 | O(1) BE 近接プレイヤーチェック（LongOpenHashSet 事前構築でループを排除） |
+| 0033 | Per-tick EntitySelector キャッシュ（dirty flag で無効化） |
+| 0034 | 非同期 tracker の teleport 修正（乗客降車をメインスレッドへ遅延し AsyncCatcher 違反を解消） |
+| 0035 | Item Entity Throttle（遠方ドロップアイテムの tick を間引き・wall time 補正でバニラ互換 despawn） |
 
 ---
 
