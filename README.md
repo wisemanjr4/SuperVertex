@@ -122,7 +122,7 @@ performance:
   block-entity-throttle-near-chunks: 4
 
   # BE throttle: 遠方 BE を何 tick に 1 回 tick するか
-  block-entity-throttle-ticks: 4
+  block-entity-throttle-tick-rate: 4
 
   # Hopper throttle を有効にするか (block-entity-throttle と独立して設定可)
   hopper-throttle: true
@@ -131,7 +131,7 @@ performance:
   hopper-throttle-near-chunks: 4
 
   # Hopper throttle: 遠方 hopper を何 tick に 1 回 tick するか
-  hopper-throttle-ticks: 4
+  hopper-throttle-tick-rate: 2
 
   # ドロップアイテム (ItemEntity) の throttle を有効にするか
   # プレイヤーから遠い地面アイテムの tick / inactiveTick を間引く
@@ -213,9 +213,9 @@ git push origin main
 | 0025 | RCT リージョンキャッシュ（XOR フィンガープリントで Union-Find 再計算をスキップ） |
 | 0026 | RCT 動的スケジューリング（AtomicInteger カウンタ + メインスレッドワークスティーリング） |
 | 0027 | Dynamic Random Tick Speed キャッシュ（プレイヤー静止中の距離計算を完全スキップ） |
-| 0028 | BE/Hopper Batch Tick（N tick 分を 1 tick で処理・バニラ互換） |
-| 0029 | Tick Phase Coordination（mob spawn・BE throttle・deep sleep の周期ずらしでスパイク平滑化） |
-| 0030 | *(欠番)* |
+| 0028 | Block Entity / Hopper Throttle（遠方 BE の tick を間引き） |
+| 0029 | BE/Hopper Batch Tick（N tick 分を 1 tick で処理） |
+| 0030 | Tick Phase Coordination（mob spawn・BE throttle・deep sleep の周期ずらしでスパイク平滑化） |
 | 0031 | tickCustomSpawners ホットフィックス（毎 tick 実行になっていたバグを修正） |
 | 0032 | O(1) BE 近接プレイヤーチェック（LongOpenHashSet 事前構築でループを排除） |
 | 0033 | Per-tick EntitySelector キャッシュ（dirty flag で無効化） |
