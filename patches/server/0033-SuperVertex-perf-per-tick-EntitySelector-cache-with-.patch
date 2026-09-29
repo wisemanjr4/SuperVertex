@@ -5,6 +5,32 @@ Subject: [PATCH] SuperVertex: perf - per-tick EntitySelector cache with
  dirty-flag invalidation
 
 
+diff --git a/src/main/java/dev/supervertex/SuperVertexConfig.java b/src/main/java/dev/supervertex/SuperVertexConfig.java
+--- a/src/main/java/dev/supervertex/SuperVertexConfig.java
++++ b/src/main/java/dev/supervertex/SuperVertexConfig.java
+@@ -337,6 +337,22 @@ public class SuperVertexConfig {
+         if (entityDeepSleepTickRate < 1) entityDeepSleepTickRate = 1;
+     }
+ 
++    // =========================================================
++    // Per-tick EntitySelector Cache
++    // =========================================================
++
++    /**
++     * セレクタ文字列をキーに、同一 tick 内の EntitySelector の結果を再利用するか。
++     * tag・スコア・NBT の変更は無効化の対象外のため、同じ tick 内で状態を変えながら
++     * 同一セレクタ文字列を繰り返し使う function では古い結果を返しうる。
++     * デフォルト: false（バニラ互換を優先）
++     */
++    public static boolean entitySelectorCache = false;
++
++    private static void entitySelectorCache() {
++        entitySelectorCache = getBoolean("performance.entity-selector-cache", entitySelectorCache);
++    }
++
+     // =========================================================
+     // Block Entity Throttle
+     // =========================================================
 diff --git a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java b/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java
 index 7e66aaa960ce7b6dda7c064d4c6856cc4b368b58..73360d7c4c0eabd020fe1f29f7f81945d9167009 100644
 --- a/src/main/java/net/minecraft/commands/arguments/selector/EntitySelector.java
@@ -25,7 +51,7 @@ index 7e66aaa960ce7b6dda7c064d4c6856cc4b368b58..73360d7c4c0eabd020fe1f29f7f81945
          this.checkPermissions(source);
 +        // SuperVertex start - per-tick EntitySelector cache
 +        // キャッシュ条件: 距離指定なし・AABBなし・単一ワールド・@s/@p名前/UUID指定なし・dirty フラグなし
-+        if (this._svRawSelector != null
++        if (dev.supervertex.SuperVertexConfig.entitySelectorCache && this._svRawSelector != null
 +                && this.range.isAny()
 +                && this.aabb == null
 +                && this.worldLimited
@@ -51,7 +77,7 @@ index 7e66aaa960ce7b6dda7c064d4c6856cc4b368b58..73360d7c4c0eabd020fe1f29f7f81945
 -                return this.sortAndLimit(vec3d, list);
 +                java.util.List<? extends Entity> _svResult = this.sortAndLimit(vec3d, list);
 +                // SuperVertex start - per-tick EntitySelector cache: キャッシュ条件を満たす場合は格納
-+                if (this._svRawSelector != null
++                if (dev.supervertex.SuperVertexConfig.entitySelectorCache && this._svRawSelector != null
 +                        && this.range.isAny()
 +                        && this.aabb == null
 +                        && this.worldLimited) {

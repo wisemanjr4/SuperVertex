@@ -143,6 +143,10 @@ performance:
 
   # Item throttle: 遠方アイテムを何 tick に 1 回 tick するか
   item-entity-throttle-tick-rate: 10
+
+  # 同一 tick 内の EntitySelector 結果をセレクタ文字列で再利用するか
+  # tag・スコア変更は無効化されないため、バニラ互換を優先して既定は false
+  entity-selector-cache: false
 ```
 
 ---
