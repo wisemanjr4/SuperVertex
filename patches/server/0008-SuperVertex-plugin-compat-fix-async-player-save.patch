@@ -110,7 +110,7 @@ index e9db2ee5819f6b81973472ea74bc0708612e30be..1d3d678030baf2e3704a4c217e883e6c
      protected final DataFixer fixerUpper;
  
      public PlayerDataStorage(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer) {
-@@ -48,6 +52,60 @@ public class PlayerDataStorage {
+@@ -48,6 +52,63 @@ public class PlayerDataStorage {
  
      }
  
@@ -133,11 +133,14 @@ index e9db2ee5819f6b81973472ea74bc0708612e30be..1d3d678030baf2e3704a4c217e883e6c
 +        final java.util.UUID uuid = player.getUUID();
 +        final String uuidStr = player.getStringUUID();
 +        // ディスク書き込みのみ非同期で実行
-+        java.util.concurrent.CompletableFuture<Void> future = java.util.concurrent.CompletableFuture.runAsync(() -> {
-+            this.writeSnapshot(snapshot, uuidStr);
-+        }, dev.supervertex.SuperVertexThreadPool.TRACKER_POOL);
-+        this.pendingAsyncSaves.put(uuid, future);
-+        future.whenComplete((v, ex) -> this.pendingAsyncSaves.remove(uuid));
++        final Runnable write = () -> this.writeSnapshot(snapshot, uuidStr);
++        // 同一UUIDの書き込みは直列化し、前の保存が未完了なら後ろに連結する（順序逆転・取りこぼし防止）
++        final java.util.concurrent.CompletableFuture<Void> future = this.pendingAsyncSaves.compute(uuid, (k, prev) ->
++            prev == null || prev.isDone()
++                ? java.util.concurrent.CompletableFuture.runAsync(write, dev.supervertex.SuperVertexThreadPool.TRACKER_POOL)
++                : prev.handle((v, ex) -> (Void) null).thenRunAsync(write, dev.supervertex.SuperVertexThreadPool.TRACKER_POOL));
++        // 自分の登録だけを削除する（後発の保存の記録を消さない）
++        future.whenComplete((v, ex) -> this.pendingAsyncSaves.remove(uuid, future));
 +    }
 +
 +    private void writeSnapshot(CompoundTag snapshot, String uuidStr) {
